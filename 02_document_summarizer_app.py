@@ -20,7 +20,7 @@ import os
 from tempfile import NamedTemporaryFile
 
 # Load API Key
-OPENAI_API_KEY = yaml.safe_load(open('credentials'))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # 1.0 LOAD AND SUMMARIZE FUNCTION
 
