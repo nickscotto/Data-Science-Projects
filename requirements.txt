@@ -4,4 +4,4 @@ langchain-core
 openai
 pyyaml
 streamlit
-PyPDF2
+pypdf
