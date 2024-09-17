@@ -120,4 +120,3 @@ else:
 #     - WHAT IF WE HAD A FULL DIRECTORY OF PDF'S?
 #     - WHAT IF WE WANTED TO DO MORE COMPLEX ANALYSIS?
 
-C:\Users\nicho\Downloads\DS4B_301P_FASTRACK\DS4B_301P_FASTRACK\02-AI-Business-Summarization-App\02-AI-Business-Summarization-App
