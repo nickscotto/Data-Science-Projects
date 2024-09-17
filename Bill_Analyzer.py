@@ -52,12 +52,12 @@ def load_and_summarize(file, use_template =False):
             
             #History
             Additionally, include any historical context, previous attempts to address similar issues, or comparisons to similar legislation passed in the past.
+
+            #Who?
+            Who are the key stakeholders affected by the bill? Include groups that will benefit or face challenges due to the bill.
             
             #What?
             What is the main objective of this bill? Provide a summary of the key points and sections.
-            
-            #Who?
-            Who are the key stakeholders affected by the bill? Include groups that will benefit or face challenges due to the bill.
             
             #When?
             When is the bill expected to take effect, and over what timeline? Detail any deadlines, phased rollouts, or sunset provisions.
