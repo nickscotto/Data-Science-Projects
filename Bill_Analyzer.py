@@ -108,7 +108,6 @@ if uploaded_file is not None:
              
              summary = load_and_summarize(uploaded_file, use_template)
              
-             st.subheader("Analysis Results:")
              st.markdown(summary)
 else:
     
