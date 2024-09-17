@@ -20,7 +20,7 @@ import os
 from tempfile import NamedTemporaryFile
 
 # Load API Key
-OPENAI_API_KEY = os.get('key')
+OPENAI_API_KEY = os.getenv('key')
 
 # 1.0 LOAD AND SUMMARIZE FUNCTION
 
