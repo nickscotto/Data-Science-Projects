@@ -1,4 +1,5 @@
 streamlit
 pdfplumber
 pandas
-openpyxl
+gspread
+google-auth
