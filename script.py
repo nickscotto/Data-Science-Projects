@@ -1,18 +1,16 @@
 import streamlit as st
 import io
+import os
 import re
 import uuid
 import hashlib
 from datetime import datetime
 import pdfplumber
 import pandas as pd
-
-# Google Sheets imports
 import gspread
 from google.oauth2.service_account import Credentials
 
 # --- Google Sheets Setup ---
-# Load credentials from Streamlit secrets
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -20,19 +18,26 @@ scope = [
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 
-# Change to the name of your actual Google Sheet
-SHEET_NAME = "Your Google Sheet Name"
-worksheet = gc.open(SHEET_NAME).sheet1
+# Attempt to open an existing sheet or create one if not found.
+SHEET_NAME = "My Utility Bill Data"
+try:
+    spreadsheet = gc.open(SHEET_NAME)
+except gspread.SpreadsheetNotFound:
+    spreadsheet = gc.create(SHEET_NAME)
+    # Share the sheet with your service account email.
+    spreadsheet.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
+worksheet = spreadsheet.sheet1
 
-# --- Helper: Standardize charge type names ---
+# --- (Rest of your code remains unchanged) ---
+
+st.title("Delmarva BillWatch")
+st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
+
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
+
 def standardize_charge_type(charge_type):
-    """
-    Remove numeric kWh values from the charge type string.
-    E.g., "Distribution Charge Last 2190 kWh" becomes "Distribution Charge Last kWh".
-    """
     return re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type, flags=re.IGNORECASE).strip()
 
-# --- PDF Extraction ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
     regex_pattern = (
@@ -62,7 +67,6 @@ def extract_charges_from_pdf(file_bytes):
                                 amount = float(amount_str)
                             except ValueError:
                                 continue
-                            # Skip lines that look like 'page', 'meter', etc.
                             if any(keyword in desc.lower() for keyword in ["page", "year", "meter", "temp", "date"]):
                                 continue
                             rows.append({
@@ -86,7 +90,6 @@ def extract_metadata_from_pdf(file_bytes):
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
                 except Exception:
                     metadata["Bill_Month_Year"] = candidate
-                # Next non-empty line is person's name
                 for j in range(i+1, len(lines)):
                     candidate2 = lines[j].strip()
                     if candidate2:
@@ -95,16 +98,10 @@ def extract_metadata_from_pdf(file_bytes):
                 break
     return metadata
 
-# --- Main Processing ---
 def process_pdf(file_io):
-    # Compute file hash for duplicates
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    
-    # Extract data
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
-
-    # Consolidate charges
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -116,8 +113,8 @@ def process_pdf(file_io):
                 consolidated[ct]["Rate"] = rate_val
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
-
-    # Ephemeral user ID mapping in session state
+    
+    # Use Person for mapping User_ID.
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
     person = metadata.get("Person", "")
@@ -126,18 +123,17 @@ def process_pdf(file_io):
     else:
         user_id = str(uuid.uuid4())
         st.session_state.customer_ids[person] = user_id
-
-    # Check if Bill_ID exists for this hash
-    existing_records = worksheet.get_all_records()
+    
+    # Check duplicate in Google Sheets using bill_hash.
+    existing = worksheet.get_all_records()
     bill_id = None
-    for rec in existing_records:
-        if rec.get("Bill_Hash") == bill_hash:
-            bill_id = rec.get("Bill_ID")
+    for row in existing:
+        if row.get("Bill_Hash") == bill_hash:
+            bill_id = row.get("Bill_ID")
             break
     if not bill_id:
         bill_id = str(uuid.uuid4())
-
-    # Build the row to append
+    
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
@@ -149,55 +145,31 @@ def process_pdf(file_io):
             output_row[f"{ct} Amount"] = data["Amount"]
         if data["Rate"]:
             output_row[f"{ct} Rate"] = data["Rate"]
-    
     return output_row
 
 def append_row_to_sheet(row_dict):
-    """
-    Appends a row to the Google Sheet. 
-    Dynamically handles new columns if needed.
-    """
-    # Read all existing rows to get the header
     existing = worksheet.get_all_records()
     if existing:
         headers = list(existing[0].keys())
     else:
         headers = []
-
-    # Ensure we have columns for each key
-    # If the row has new keys not in headers, add them
     for key in row_dict.keys():
         if key not in headers:
             headers.append(key)
-
-    # If the sheet is empty, append headers as first row
     if not existing:
         worksheet.append_row(headers)
-
-    # Convert row_dict to a row in the order of headers
-    row_values = []
-    for h in headers:
-        row_values.append(str(row_dict.get(h, "")))  # Convert to string
-
-    # Append the row
+    row_values = [str(row_dict.get(h, "")) for h in headers]
     worksheet.append_row(row_values)
-
-# --- Streamlit App ---
-st.title("Delmarva BillWatch")
-st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
-
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     file_io = io.BytesIO(file_bytes)
-    # Check if this bill is already in the sheet
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     existing = worksheet.get_all_records()
-    is_duplicate = any(r.get("Bill_Hash") == bill_hash for r in existing)
-    if is_duplicate:
+    duplicate = any(r.get("Bill_Hash") == bill_hash for r in existing)
+    if duplicate:
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
-        row_dict = process_pdf(file_io)
-        append_row_to_sheet(row_dict)
+        output_row = process_pdf(file_io)
+        append_row_to_sheet(output_row)
         st.success("Thank you for your contribution!")
