@@ -8,26 +8,23 @@ from datetime import datetime
 import pdfplumber
 import pandas as pd
 
-# --- Helper function to standardize charge type names ---
+# --- File Paths (using relative paths for Codespace persistence) ---
+EXCEL_PATH = "output.xlsx"
+MAPPING_PATH = "customer_ids.csv"
+
+# --- Helper: Standardize charge type names ---
 def standardize_charge_type(charge_type):
     """
     Remove numeric kWh values from the charge type string.
-    For example, "Distribution Charge Last 2190 kWh" and 
-    "Distribution Charge Last 1980 kWh" both become "Distribution Charge Last kWh".
+    E.g., "Distribution Charge Last 2190 kWh" becomes "Distribution Charge Last kWh".
     """
     standardized = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type, flags=re.IGNORECASE)
     return standardized.strip()
 
-# --- Functions to extract data from a PDF bill ---
-
+# --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     """
     Extract charge rows from pages 2 and 3.
-    Uses a regex to capture:
-      - The charge description (desc)
-      - An optional rate (rate) of the form 'X $<rate> per kWh'
-      - The trailing amount (amount)
-    Filters out lines with unwanted keywords.
     Returns a list of dicts with keys: Charge_Type, Rate, Amount.
     """
     rows = []
@@ -36,7 +33,7 @@ def extract_charges_from_pdf(file_bytes):
         r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
     )
     with pdfplumber.open(file_bytes) as pdf:
-        # Process pages 2 and 3 (0-indexed: pages[1] and pages[2])
+        # Process pages 2 and 3 (0-indexed)
         for page_index in [1, 2]:
             if page_index < len(pdf.pages):
                 text = pdf.pages[page_index].extract_text() or ""
@@ -72,9 +69,8 @@ def extract_charges_from_pdf(file_bytes):
 def extract_metadata_from_pdf(file_bytes):
     """
     Extract metadata from page 1.
-    Looks for a line like "January 2025" and converts it to "MM-YYYY".
-    Also assumes the next non-empty line is the person's name.
-    Returns a dict with keys:
+    Finds a line like "January 2025" (converted to "MM-YYYY") and assumes the next non-empty line is the person's name.
+    Returns a dict with:
       - "Bill_Month_Year": formatted as "MM-YYYY"
       - "Person": the extracted name.
     """
@@ -91,7 +87,7 @@ def extract_metadata_from_pdf(file_bytes):
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
                 except Exception:
                     metadata["Bill_Month_Year"] = candidate
-                # Assume the next non-empty line is the person's name.
+                # Next non-empty line assumed to be the person's name.
                 for j in range(i+1, len(lines)):
                     candidate2 = lines[j].strip()
                     if candidate2:
@@ -100,27 +96,42 @@ def extract_metadata_from_pdf(file_bytes):
                 break
     return metadata
 
+# --- Mapping Persistence Functions ---
+def load_customer_ids(mapping_path):
+    """Load the Person-to-User_ID mapping from CSV, if available."""
+    if os.path.exists(mapping_path):
+        df_map = pd.read_csv(mapping_path)
+        return dict(zip(df_map["Person"], df_map["User_ID"]))
+    else:
+        return {}
+
+def save_customer_ids(mapping, mapping_path):
+    """Save the Person-to-User_ID mapping to CSV."""
+    df_map = pd.DataFrame(mapping.items(), columns=["Person", "User_ID"])
+    os.makedirs(os.path.dirname(mapping_path) or ".", exist_ok=True)
+    df_map.to_csv(mapping_path, index=False)
+
+# --- Main PDF Processing Function ---
 def process_pdf(file_io):
     """
-    Process a PDF bill (provided as a file-like object) and return a row dictionary.
+    Process a PDF bill (file-like object) and return a row dictionary.
     The row includes:
       - User_ID (unique per Person)
       - Bill_ID (unique per bill, determined by bill hash)
       - Bill_Month_Year
-      - Bill_Hash (used internally for duplicate detection)
-      - One column per standardized charge type (with separate Amount and Rate columns).
-    Note: The Person field is used internally for mapping but is not output.
+      - Bill_Hash (for duplicate detection)
+      - Standardized charge columns (with Amount and Rate)
+    (The Person field is used internally for mapping but is not output.)
     """
-    # Compute bill hash from the file bytes.
+    # Compute a hash of the file for duplicate detection.
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     
-    # Consolidate charges (sum duplicate amounts; keep first non-empty rate)
+    # Consolidate charges (standardizing keys)
     consolidated = {}
     for c in charges:
-        # Standardize charge type
         ct = standardize_charge_type(c["Charge_Type"])
         amt = c["Amount"]
         rate_val = c["Rate"]
@@ -131,29 +142,29 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Determine the unique User_ID for the person.
+    # Load or initialize the customer mapping.
     if "customer_ids" not in st.session_state:
-        st.session_state.customer_ids = {}
+        st.session_state.customer_ids = load_customer_ids(MAPPING_PATH)
+    
     person = metadata.get("Person", "")
     if person in st.session_state.customer_ids:
         user_id = st.session_state.customer_ids[person]
     else:
         user_id = str(uuid.uuid4())
         st.session_state.customer_ids[person] = user_id
+        save_customer_ids(st.session_state.customer_ids, MAPPING_PATH)
     
-    # Check if a bill with this hash already exists.
+    # Check for duplicate bill using bill_hash.
     bill_id = None
     if "df" in st.session_state and not st.session_state.df.empty and "Bill_Hash" in st.session_state.df.columns:
         duplicates = st.session_state.df[st.session_state.df["Bill_Hash"] == bill_hash]
         if not duplicates.empty:
-            # Use the existing Bill_ID from the duplicate.
             bill_id = duplicates.iloc[0]["Bill_ID"]
     
-    # If not duplicate, generate a new Bill_ID.
     if not bill_id:
         bill_id = str(uuid.uuid4())
     
-    # Build the row.
+    # Build the row (do not include Person in the output).
     row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
@@ -167,53 +178,35 @@ def process_pdf(file_io):
             row[f"{ct} Rate"] = data["Rate"]
     return row
 
-def save_excel_to_disk(df, excel_file=r"C:\Users\nicho\Downloads\output.xlsx"):
-    """
-    Save the DataFrame as an Excel file to the predetermined path.
-    """
-    os.makedirs(os.path.dirname(excel_file), exist_ok=True)
+# --- Function to Save Data ---
+def save_excel_to_disk(df, excel_file=EXCEL_PATH):
+    """Save the DataFrame as an Excel file to a relative path."""
+    os.makedirs(os.path.dirname(excel_file) or ".", exist_ok=True)
     df.to_excel(excel_file, index=False)
 
-# --- Streamlit App ---
+# --- Streamlit App Interface ---
+st.title("Delmarva BillWatch")
+st.write("Upload your PDF bill. Your deidentified utility charge information will be added to our secured database for analysis.")
 
-st.title("Electricity Bill Processor")
-st.write("Please, upload your PDF bill. Your deidentified utility charge information will be added to our secured database.")
-
-# Predetermined path for the output Excel file.
-excel_path = r"C:\Users\nicho\Downloads\output.xlsx"
-
-# Load existing Excel file if available and rebuild the customer_ids mapping.
+# Load existing Excel file (if any) from the Codespace.
 if "df" not in st.session_state:
-    if os.path.exists(excel_path):
-        st.session_state.df = pd.read_excel(excel_path)
-        # Rebuild the mapping from Person to User_ID if the Person column exists.
-        if "Person" in st.session_state.df.columns:
-            st.session_state.customer_ids = {}
-            for _, row in st.session_state.df.iterrows():
-                # Here, if the Person column is not output, you may store it internally.
-                # For this example, we assume the Person was used to build the mapping previously.
-                person_val = row.get("Person", "")
-                user_id = row.get("User_ID", "")
-                if person_val and user_id:
-                    st.session_state.customer_ids[person_val] = user_id
-        else:
-            st.session_state.customer_ids = {}
+    if os.path.exists(EXCEL_PATH):
+        st.session_state.df = pd.read_excel(EXCEL_PATH)
     else:
         st.session_state.df = pd.DataFrame()
-        st.session_state.customer_ids = {}
 
-# Allow only one PDF file at a time.
+# Allow only one PDF upload at a time.
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     file_io = io.BytesIO(file_bytes)
-    # Compute bill hash to check for duplicate
+    # Check duplicate by computing bill hash.
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     if "Bill_Hash" in st.session_state.df.columns and (st.session_state.df["Bill_Hash"] == bill_hash).any():
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
         row = process_pdf(file_io)
         st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
-        save_excel_to_disk(st.session_state.df, excel_file=excel_path)
+        save_excel_to_disk(st.session_state.df, excel_file=EXCEL_PATH)
         st.success("Thank you for your contribution!")
