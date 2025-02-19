@@ -91,7 +91,6 @@ def extract_metadata_from_pdf(file_bytes):
 # --- Main PDF Processing Function ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     
@@ -154,8 +153,17 @@ def append_row_to_sheet(row_dict):
     worksheet.append_row(row_values)
 
 # --- Streamlit App Interface ---
+
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
+
+# Privacy Disclaimer
+st.markdown("""
+**Privacy Disclaimer:**  
+By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power.  
+Your information will not be shared publicly or sold.  
+This form is for informational and organizational purposes only and does not constitute legal representation.
+""")
 
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
 
