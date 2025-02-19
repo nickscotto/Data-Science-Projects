@@ -15,35 +15,24 @@ scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-# Authenticate using credentials stored in Streamlit Secrets
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 
-# Set the spreadsheet name as per your sheet.
+# Set the spreadsheet name (must exactly match the sheet in Google Sheets)
 SHEET_NAME = "Bill_Data"
 try:
     spreadsheet = gc.open(SHEET_NAME)
 except gspread.SpreadsheetNotFound:
     spreadsheet = gc.create(SHEET_NAME)
-    # Share the sheet with your service account email.
     spreadsheet.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
 worksheet = spreadsheet.sheet1
 
-# --- Helper: Standardize charge type names ---
+# --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
-    """
-    Remove numeric kWh values from the charge type string.
-    E.g., "Distribution Charge Last 2190 kWh" becomes "Distribution Charge Last kWh".
-    """
-    standardized = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type, flags=re.IGNORECASE)
-    return standardized.strip()
+    return re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type, flags=re.IGNORECASE).strip()
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
-    """
-    Extract charge rows from pages 2 and 3.
-    Returns a list of dicts with keys: Charge_Type, Rate, Amount.
-    """
     rows = []
     regex_pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?"
@@ -82,13 +71,6 @@ def extract_charges_from_pdf(file_bytes):
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
-    """
-    Extract metadata from page 1.
-    Finds a line like "January 2025" (converted to "MM-YYYY") and assumes the next non-empty line is the person's name.
-    Returns a dict with:
-      - "Bill_Month_Year": formatted as "MM-YYYY"
-      - "Person": the extracted name.
-    """
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
@@ -112,23 +94,12 @@ def extract_metadata_from_pdf(file_bytes):
 
 # --- Main PDF Processing Function ---
 def process_pdf(file_io):
-    """
-    Process a PDF bill (file-like object) and return a row dictionary.
-    The row includes:
-      - User_ID (unique per Person)
-      - Bill_ID (unique per bill, determined by bill hash)
-      - Bill_Month_Year
-      - Bill_Hash (for duplicate detection)
-      - Standardized charge columns (with Amount and Rate)
-    (The Person field is used internally for mapping but is not output.)
-    """
-    # Compute bill hash.
+    # Compute bill hash for duplicate detection.
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     
-    # Consolidate charges.
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -141,7 +112,6 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Use Person for mapping User_ID.
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
     person = metadata.get("Person", "")
@@ -151,7 +121,6 @@ def process_pdf(file_io):
         user_id = str(uuid.uuid4())
         st.session_state.customer_ids[person] = user_id
     
-    # Check for duplicate bill using Bill_Hash.
     existing = worksheet.get_all_records()
     bill_id = None
     for row in existing:
@@ -175,20 +144,16 @@ def process_pdf(file_io):
     return output_row
 
 def append_row_to_sheet(row_dict):
-    # Get current records and header.
     existing = worksheet.get_all_records()
     if existing:
         headers = list(existing[0].keys())
     else:
         headers = []
-    # Add any new keys to the header.
     for key in row_dict.keys():
         if key not in headers:
             headers.append(key)
-    # If sheet is empty, add headers as first row.
     if not existing:
         worksheet.append_row(headers)
-    # Order row values according to headers.
     row_values = [str(row_dict.get(h, "")) for h in headers]
     worksheet.append_row(row_values)
 
@@ -201,7 +166,6 @@ uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multipl
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     file_io = io.BytesIO(file_bytes)
-    # Duplicate detection.
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     existing = worksheet.get_all_records()
     duplicate = any(r.get("Bill_Hash") == bill_hash for r in existing)
