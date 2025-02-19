@@ -1,7 +1,4 @@
-﻿langchain-community
-langchain-openai
-langchain-core
-openai
-pyyaml
 streamlit
-pypdf
+pdfplumber
+pandas
+openpyxl
