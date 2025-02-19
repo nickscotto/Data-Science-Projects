@@ -18,13 +18,9 @@ scope = [
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 
-# Set the spreadsheet name (must exactly match the sheet in Google Sheets)
-SHEET_NAME = "Bill_Data"
-try:
-    spreadsheet = gc.open(SHEET_NAME)
-except gspread.SpreadsheetNotFound:
-    spreadsheet = gc.create(SHEET_NAME)
-    spreadsheet.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
+# Use the spreadsheet ID to open your Google Sheet.
+SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
 # --- Helper: Standardize Charge Type Names ---
@@ -94,7 +90,6 @@ def extract_metadata_from_pdf(file_bytes):
 
 # --- Main PDF Processing Function ---
 def process_pdf(file_io):
-    # Compute bill hash for duplicate detection.
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     
     charges = extract_charges_from_pdf(file_io)
@@ -112,6 +107,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
+    # Use Person for mapping User_ID.
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
     person = metadata.get("Person", "")
