@@ -72,21 +72,23 @@ def extract_charges_from_pdf(file_bytes):
 
 def extract_metadata_from_pdf(file_bytes):
     """
-    Extract metadata from page 1.
-    Scans all non-empty lines for a date in the form "January 2024" or abbreviated "Jan 2024"
-    and uses the next non-empty line as the person's name.
-    If not found, leaves the fields empty.
+    Extract metadata (Bill_Month_Year and Person) from page 1.
+    It scans all non-empty lines for a date in the form "January 2024" (or abbreviated "Jan 2024")
+    and then among subsequent lines looks for a candidate that appears to be a name.
+    If no candidate is found, it leaves the fields empty.
     """
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
     
+    # Define date patterns.
     date_patterns = [
         r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$",
         r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}$"
     ]
     
+    date_index = None
     for i, line in enumerate(lines):
         for pattern in date_patterns:
             if re.match(pattern, line, re.IGNORECASE):
@@ -98,17 +100,29 @@ def extract_metadata_from_pdf(file_bytes):
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
                 except Exception:
                     metadata["Bill_Month_Year"] = line
-                # Use the next non-empty line as the person's name.
-                if i + 1 < len(lines):
-                    metadata["Person"] = lines[i + 1]
+                date_index = i
                 break
         if metadata["Bill_Month_Year"]:
             break
+
+    # Look for a candidate name in lines after the date.
+    if date_index is not None:
+        for line in lines[date_index+1:]:
+            # Skip lines that contain typical billing phrases.
+            if "for the period" in line.lower():
+                continue
+            # Heuristic: if the line contains at least one space and is mostly uppercase, assume it's a name.
+            if " " in line:
+                letters = [ch for ch in line if ch.isalpha()]
+                if letters and all(ch.isupper() for ch in letters):
+                    metadata["Person"] = line
+                    break
+    # If no candidate found, leave Person empty.
     return metadata
 
-# --- Generate a User_ID without recording the person's name ---
+# --- Generate a User_ID Without Storing the Actual Name ---
 def get_user_id(person):
-    """Compute a deterministic hash of the person's name as User_ID, or generate a random one if empty."""
+    """Compute a deterministic User_ID by hashing the person's name (if available)."""
     if person:
         return hashlib.sha256(person.encode('utf-8')).hexdigest()
     else:
@@ -145,11 +159,10 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Generate User_ID by hashing the person's name (do not record the actual name)
+    # Generate User_ID using a hash of the person's name (without storing the name)
     person = metadata.get("Person", "")
     user_id = get_user_id(person)
     
-    # Check for duplicate bill in Google Sheets using Bill_Hash.
     existing = get_all_records_safe(worksheet)
     bill_id = None
     for row in existing:
