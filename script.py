@@ -161,6 +161,23 @@ def extract_charges(file_bytes):
                         "Rate": parsed["rate"],
                         "Amount": parsed["amount"]
                     })
+    # --- Fallback search for missing Total Electric Charges - Residential Service ---
+    if not any(ch.get("Mapped") == "Total Electric Charges - Residential Service" for ch in charges):
+        with pdfplumber.open(file_bytes) as pdf:
+            for page in pdf.pages:
+                for line in page.extract_text().splitlines():
+                    if "total electric charges - residential service" in line.lower():
+                        parsed = parse_charge_line(line.strip())
+                        if parsed:
+                            cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", parsed["desc"], flags=re.IGNORECASE).strip()
+                            mapped = map_charge_description(cleaned_desc)
+                            if mapped == "Total Electric Charges - Residential Service":
+                                charges.append({
+                                    "Mapped": mapped,
+                                    "Rate": parsed["rate"],
+                                    "Amount": parsed["amount"]
+                                })
+                                break  # Found it on this page; no need to continue
     return charges
 
 # --- Metadata Extraction ---
@@ -236,19 +253,22 @@ def process_pdf(file_io):
         "Bill_Month_Year": meta["Bill_Month_Year"],
         "Bill_Hash": bill_hash
     }
-    # Use a "max" logic for duplicate keys so that a nonzero total replaces a zero value.
+    # When adding charges, update if the new value is nonzero.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
             amt_col = f"{mapped} Amount"
             rate_col = f"{mapped} Rate"
             if amt_col in output:
-                # Update only if the new amount is greater than the existing value.
-                output[amt_col] = max(output[amt_col], ch["Amount"])
+                # Only update if the new amount is not zero.
+                if ch["Amount"] != 0.0:
+                    output[amt_col] = ch["Amount"]
+                    if ch["Rate"]:
+                        output[rate_col] = ch["Rate"]
             else:
                 output[amt_col] = ch["Amount"]
-            if ch["Rate"]:
-                output[rate_col] = ch["Rate"]
+                if ch["Rate"]:
+                    output[rate_col] = ch["Rate"]
     return output
 
 def append_row_to_sheet(row_dict):
