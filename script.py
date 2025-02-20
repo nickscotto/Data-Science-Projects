@@ -1,12 +1,10 @@
 import streamlit as st
 import io
-import os
 import re
 import uuid
 import hashlib
 from datetime import datetime
 import pdfplumber
-import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -18,7 +16,6 @@ scope = [
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 
-# Use the spreadsheet ID to open your Google Sheet.
 SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
@@ -107,7 +104,6 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Use Person for mapping User_ID.
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
     person = metadata.get("Person", "")
@@ -139,18 +135,33 @@ def process_pdf(file_io):
             output_row[f"{ct} Rate"] = data["Rate"]
     return output_row
 
+# --- Updated Sheet Append Function ---
 def append_row_to_sheet(row_dict):
-    existing = worksheet.get_all_records()
-    if existing:
-        headers = list(existing[0].keys())
+    # Get current headers from the sheet (or initialize if empty)
+    current_data = worksheet.get_all_values()
+    if current_data:
+        headers = current_data[0]  # First row is headers
+        existing_rows = current_data[1:]  # Remaining rows are data
     else:
         headers = []
-    for key in row_dict.keys():
-        if key not in headers:
-            headers.append(key)
-    if not existing:
-        worksheet.append_row(headers)
-    row_values = [str(row_dict.get(h, "")) for h in headers]
+        existing_rows = []
+
+    # Update headers with any new columns from row_dict
+    new_headers = set(row_dict.keys()) - set(headers)
+    if new_headers:
+        headers.extend(sorted(new_headers))  # Sort for consistency
+        # Update the header row in the sheet
+        worksheet.update("A1", [headers])
+        # Pad existing rows with empty strings for new columns
+        if existing_rows:
+            for i, row in enumerate(existing_rows, start=2):  # Start at row 2
+                row.extend([""] * len(new_headers))
+                worksheet.update(f"A{i}", [row])
+
+    # Prepare the new row with values aligned to the full header set
+    row_values = [str(row_dict.get(header, "")) for header in headers]
+    
+    # Append the new row
     worksheet.append_row(row_values)
 
 # --- Streamlit App Interface ---
