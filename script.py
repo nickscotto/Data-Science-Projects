@@ -27,44 +27,36 @@ worksheet = spreadsheet.sheet1
 # --- Mapping for Charge Types ---
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
-    "distribution charge first": "Distribution Charge First kWh",
-    "distribution charge last": "Distribution Charge Last kWh",
-    "myp adjustment": "MYP Adjustment First",
-    "environmental surcharge": "Environmental Surcharge kWh",
-    "empower maryland": "EmPOWER Maryland kWh",
+    "distribution charge": "Distribution Charge",
+    "environmental surcharge": "Environmental Surcharge",
+    "empower maryland charge": "EmPOWER Maryland Charge",
     "administrative credit": "Administrative Credit",
     "universal service program": "Universal Service Program",
-    "md franchise tax": "MD Franchise Tax kWh",
+    "md franchise tax": "MD Franchise Tax",
     "total electric delivery charges": "Total Electric Delivery Charges",
-    "standard offer service": "Standard Offer Service & Transmission",
+    "standard offer service & transmission": "Standard Offer Service & Transmission",
     "procurement cost adjustment": "Procurement Cost Adjustment",
     "total electric supply charges": "Total Electric Supply Charges",
-    "total electric charges - residential service": "Total Electric Charges - Residential Service",
-    "delivery": "Delivery",
-    "supply": "Supply"
+    "total electric charges - residential service": "Total Electric Charges - Residential Service"
 }
 
-# Define the complete set of expected output keys in the desired order.
+# Define the complete set of expected output keys in the desired order
 EXPECTED_HEADERS = [
     "User_ID",
     "Bill_ID",
     "Bill_Month_Year",
     "Bill_Hash",
     "Customer Charge Amount",
-    "Distribution Charge First kWh Amount",
-    "Distribution Charge First kWh Rate",
-    "Distribution Charge Last kWh Amount",
-    "Distribution Charge Last kWh Rate",
-    "MYP Adjustment First Amount",
-    "MYP Adjustment First Rate",
-    "Environmental Surcharge kWh Amount",
-    "Environmental Surcharge kWh Rate",
-    "EmPOWER Maryland kWh Amount",
-    "EmPOWER Maryland kWh Rate",
+    "Distribution Charge Amount",
+    "Distribution Charge Rate",
+    "Environmental Surcharge Amount",
+    "Environmental Surcharge Rate",
+    "EmPOWER Maryland Charge Amount",
+    "EmPOWER Maryland Charge Rate",
     "Administrative Credit Amount",
     "Universal Service Program Amount",
-    "MD Franchise Tax kWh Amount",
-    "MD Franchise Tax kWh Rate",
+    "MD Franchise Tax Amount",
+    "MD Franchise Tax Rate",
     "Total Electric Delivery Charges Amount",
     "Standard Offer Service & Transmission Amount",
     "Standard Offer Service & Transmission Rate",
@@ -83,7 +75,6 @@ def get_all_records_safe(ws):
         data = ws.get_all_values()
         if data and len(data) > 1:
             headers = data[0]
-            # Make header names unique
             seen = {}
             unique_headers = []
             for h in headers:
@@ -107,42 +98,28 @@ def get_user_id(name):
     normalized = name.strip().upper() or "UNKNOWN"
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-# --- Parsing Charge Lines ---
+# --- Parsing and Extraction Functions ---
 def parse_charge_line(line):
-    pattern1 = (
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
-    )
-    pattern2 = r"^(?P<desc>.+?)\s+\$(?P<amount>[\d,\.]+)$"
-    m = re.match(pattern1, line)
-    if not m:
-        m = re.match(pattern2, line)
-    if m:
-        raw_desc = m.group("desc").strip()
-        rate_val = m.group("rate") if "rate" in m.groupdict() else ""
-        amt_str = m.group("amount").replace(",", "").replace("−", "")
-        try:
-            amt_val = float(amt_str)
-        except ValueError:
-            return None
-        return {"desc": raw_desc, "rate": rate_val, "amount": amt_val}
+    patterns = [
+        # Pattern for lines with kWh calculation (e.g., "95 kWh X $0.0600150 per kWh 5.70")
+        r"^(?P<desc>.+?)(?:\s+\d+\s*kWh\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,\.]+)$",
+        # Pattern for simple amount lines (e.g., "Customer Charge 9.19")
+        r"^(?P<desc>.+?)\s+\$(?P<amount>-?[\d,\.]+)$"
+    ]
+    
+    for pattern in patterns:
+        m = re.match(pattern, line)
+        if m:
+            raw_desc = m.group("desc").strip()
+            rate_val = m.group("rate") if "rate" in m.groupdict() and m.group("rate") else ""
+            amt_str = m.group("amount").replace(",", "").replace("−", "-")
+            try:
+                amt_val = float(amt_str)
+                return {"desc": raw_desc, "rate": rate_val, "amount": amt_val}
+            except ValueError:
+                continue
     return None
 
-def combine_table_lines(table_lines):
-    combined = []
-    buffer = ""
-    for line in table_lines:
-        candidate = (buffer + " " + line).strip() if buffer else line
-        parsed = parse_charge_line(candidate)
-        if parsed:
-            combined.append(candidate)
-            buffer = ""
-        else:
-            buffer = candidate
-    if buffer:
-        combined.append(buffer)
-    return combined
-
-# --- Extracting Charge Tables from PDF ---
 def extract_charge_tables(file_bytes):
     tables = []
     with pdfplumber.open(file_bytes) as pdf:
@@ -151,20 +128,34 @@ def extract_charge_tables(file_bytes):
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             i = 0
             while i < len(lines):
-                if ("type of charge" in lines[i].lower() and
-                    "how we calculate" in lines[i].lower() and
+                if ("type of charge" in lines[i].lower() and 
+                    "how we calculate" in lines[i].lower() and 
                     "amount($" in lines[i].lower()):
                     table_lines = []
                     i += 1
                     while i < len(lines):
                         curr = lines[i]
-                        if ("type of charge" in curr.lower() and "amount($" in curr.lower()):
+                        if ("type of charge" in curr.lower() and 
+                            "how we calculate" in curr.lower() and 
+                            "amount($" in curr.lower()):
                             break
-                        table_lines.append(curr)
+                        if curr.strip():
+                            table_lines.append(curr)
                         i += 1
+                    
                     if table_lines:
-                        combined = combine_table_lines(table_lines)
-                        tables.append(combined)
+                        combined = []
+                        buffer = ""
+                        for line in table_lines:
+                            candidate = (buffer + " " + line).strip() if buffer else line
+                            parsed = parse_charge_line(candidate)
+                            if parsed:
+                                combined.append(parsed)
+                                buffer = ""
+                            else:
+                                buffer = candidate
+                        if combined:
+                            tables.append(combined)
                 else:
                     i += 1
     return tables
@@ -172,41 +163,18 @@ def extract_charge_tables(file_bytes):
 def extract_charges(file_bytes):
     tables = extract_charge_tables(file_bytes)
     charges = []
+    
     for table in tables:
-        for line in table:
-            parsed = parse_charge_line(line)
-            if parsed:
-                cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", parsed["desc"], flags=re.IGNORECASE).strip()
-                mapped = map_charge_description(cleaned_desc)
-                if mapped:
-                    charges.append({
-                        "Mapped": mapped,
-                        "Rate": parsed["rate"],
-                        "Amount": parsed["amount"]
-                    })
-    # Fallback search in full text:
-    expected_keys = [
-        "Customer Charge", "Distribution Charge First kWh",
-        "Distribution Charge Last kWh", "MYP Adjustment First",
-        "Environmental Surcharge kWh", "EmPOWER Maryland kWh",
-        "Administrative Credit", "Universal Service Program",
-        "MD Franchise Tax kWh", "Total Electric Delivery Charges",
-        "Standard Offer Service & Transmission", "Procurement Cost Adjustment",
-        "Total Electric Supply Charges", "Total Electric Charges - Residential Service"
-    ]
-    with pdfplumber.open(file_bytes) as pdf:
-        full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-    for key in expected_keys:
-        if not any(ch["Mapped"] == key for ch in charges):
-            pattern = re.compile(rf"(?P<desc>{re.escape(key)}.*?)\s+\$(?P<amount>-?[\d,]+(?:\.\d+)?)", re.IGNORECASE)
-            match = pattern.search(full_text)
-            if match:
-                amt = float(match.group("amount").replace(",", ""))
+        for parsed in table:
+            cleaned_desc = re.sub(r"\d+\s*kWh", "", parsed["desc"], flags=re.IGNORECASE).strip()
+            mapped = map_charge_description(cleaned_desc)
+            if mapped:
                 charges.append({
-                    "Mapped": key,
-                    "Rate": "",
-                    "Amount": amt
+                    "Mapped": mapped,
+                    "Rate": parsed["rate"],
+                    "Amount": parsed["amount"]
                 })
+    
     return charges
 
 # --- Metadata Extraction ---
@@ -263,23 +231,20 @@ def process_pdf(file_io):
     meta = extract_metadata_from_pdf(file_io)
     user_id = get_user_id(meta["Person"])
 
-    # Build an OrderedDict using the complete EXPECTED_HEADERS order.
     output = OrderedDict()
     for key in EXPECTED_HEADERS:
-        output[key] = ""  # initialize with empty string
+        output[key] = ""
 
     output["User_ID"] = user_id
     output["Bill_ID"] = str(uuid.uuid4())
     output["Bill_Month_Year"] = meta["Bill_Month_Year"]
     output["Bill_Hash"] = bill_hash
 
-    # Insert extracted charge values into the corresponding keys.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
             amt_key = f"{mapped} Amount"
             rate_key = f"{mapped} Rate"
-            # If this key is expected, update it.
             if amt_key in output:
                 output[amt_key] = ch["Amount"]
             if ch["Rate"] and rate_key in output:
@@ -293,7 +258,6 @@ def append_row_to_sheet(row_dict):
     else:
         headers = list(EXPECTED_HEADERS)
         worksheet.append_row(headers)
-    # Ensure our row follows the existing header order.
     row_values = [str(row_dict.get(h, "")) for h in headers]
     worksheet.append_row(row_values)
 
