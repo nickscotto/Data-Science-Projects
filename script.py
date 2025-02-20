@@ -13,9 +13,7 @@ scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_info(
-    st.secrets["gcp_service_account"], scopes=scope
-)
+creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 
 # Use your spreadsheet ID to open your sheet.
@@ -28,7 +26,7 @@ except Exception as e:
 worksheet = spreadsheet.sheet1
 
 # --- Mapping for Charge Types ---
-# Maps partial strings in a charge description to a standardized name.
+# Map substrings in the charge description to standardized names.
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
     "distribution charge first": "Distribution Charge First kWh",
@@ -58,7 +56,7 @@ def get_all_records_safe(ws):
         return []
 
 def map_charge_description(desc):
-    """Return the standardized charge type if any key in CHARGE_TYPE_MAP is found."""
+    """Return the standardized charge name if any key in CHARGE_TYPE_MAP appears in desc."""
     desc_lower = desc.lower()
     for partial, standard in CHARGE_TYPE_MAP.items():
         if partial in desc_lower:
@@ -66,16 +64,16 @@ def map_charge_description(desc):
     return None
 
 def get_user_id(name):
-    """Generate a deterministic User_ID by hashing the name; if name is blank, use 'Unknown'."""
+    """Generate a deterministic User_ID by hashing the name; if blank, use a random UUID."""
     name = name.strip() or "Unknown"
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
-# --- PDF Extraction for Charges ---
+# --- PDF Extraction: Charges ---
 def extract_charges_from_pdf(file_bytes):
     """
-    Scan all lines on pages 1 and 2 for patterns matching:
-       <description> [X $<rate> per kWh] <amount>
-    If the description maps to a known charge type, return it.
+    Scan every line on pages 1 and 2 for patterns of the form:
+      <description> [X $<rate> per kWh] <amount>
+    If the description matches one of the known partial strings, add it.
     """
     pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?"
@@ -83,14 +81,15 @@ def extract_charges_from_pdf(file_bytes):
     )
     charges = []
     with pdfplumber.open(file_bytes) as pdf:
-        for page_idx in [0, 1]:  # try pages 1 and 2 (index 0 and 1) – adjust if needed
+        # Check pages 1 and 2 (adjust indexes if needed)
+        for page_idx in [0, 1]:
             if page_idx < len(pdf.pages):
                 text = pdf.pages[page_idx].extract_text() or ""
                 for line in text.splitlines():
                     line = line.strip()
                     if not line:
                         continue
-                    m = re.match(pattern, line)
+                    m = re.search(pattern, line)
                     if m:
                         raw_desc = m.group("desc").strip()
                         rate_val = m.group("rate") or ""
@@ -99,9 +98,9 @@ def extract_charges_from_pdf(file_bytes):
                             amt_val = float(amt_str)
                         except ValueError:
                             continue
-                        std_desc = raw_desc  # remove digits from "kWh" parts if any
-                        std_desc = re.sub(r"\d+\s*kWh", "kWh", std_desc, flags=re.IGNORECASE).strip()
-                        mapped = map_charge_description(std_desc)
+                        # Clean the description by removing digits from kWh parts.
+                        cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", raw_desc, flags=re.IGNORECASE).strip()
+                        mapped = map_charge_description(cleaned_desc)
                         if mapped:
                             charges.append({
                                 "Mapped": mapped,
@@ -110,72 +109,64 @@ def extract_charges_from_pdf(file_bytes):
                             })
     return charges
 
-# --- PDF Extraction for Metadata (Date & Name) ---
+# --- PDF Extraction: Metadata (Date and Name) ---
 def extract_metadata_from_pdf(file_bytes):
     """
-    Extract Bill_Month_Year and Person from page 1.
-    Scans all non-empty lines for various date formats.
-    Returns:
-      - Bill_Month_Year in MM-YYYY format (if found)
-      - Person: a candidate line that appears to be a name based on heuristics, or "Unknown"
+    Extract metadata from page 1:
+      - Look for any occurrence of a date in known patterns anywhere in a line.
+      - Use re.search so that extra text is allowed.
+      - Then, try to extract the person's name from a nearby line.
+      If no name is found, default to "Unknown".
     """
     meta = {"Bill_Month_Year": "", "Person": ""}
+    date_patterns = [
+        (r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}", "%B %Y"),
+        (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}", "%b %Y"),
+        (r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}", "%B %d, %Y"),
+        (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}", "%b %d, %Y")
+    ]
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     
-    # Date patterns: (pattern, corresponding datetime format)
-    patterns = [
-        (r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$", "%B %Y"),
-        (r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}$", "%b %Y"),
-        (r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}$", "%B %d, %Y"),
-        (r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}$", "%b %d, %Y")
-    ]
-    
     date_found = False
-    date_idx = None
     for i, line in enumerate(lines):
-        for pat, fmt in patterns:
-            if re.match(pat, line, re.IGNORECASE):
+        for pat, fmt in date_patterns:
+            match = re.search(pat, line, re.IGNORECASE)
+            if match:
+                date_str = match.group(0)
                 try:
-                    parsed_date = datetime.strptime(line, fmt)
+                    parsed_date = datetime.strptime(date_str, fmt)
                     meta["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
                 except Exception:
-                    meta["Bill_Month_Year"] = ""
+                    meta["Bill_Month_Year"] = date_str
                 date_found = True
-                date_idx = i
+                # Look for a candidate name in subsequent lines that isn't a common billing term.
+                for ln in lines[i+1:]:
+                    if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary"]):
+                        continue
+                    if " " in ln:
+                        # If the line appears mostly uppercase, consider it a name.
+                        letters = [ch for ch in ln if ch.isalpha()]
+                        if letters and (sum(1 for ch in letters if ch.isupper()) / len(letters)) >= 0.8:
+                            meta["Person"] = ln
+                            break
                 break
         if date_found:
             break
 
-    # Now, search for a candidate name in lines after the date.
-    # Heuristic: the candidate should not contain common billing words, must have a space, and be mostly uppercase.
-    candidate = ""
-    if date_idx is not None:
-        for ln in lines[date_idx+1:]:
-            if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary"]):
-                continue
-            if " " in ln:
-                # Check if the line is mostly uppercase (at least 80% of letters)
-                letters = [ch for ch in ln if ch.isalpha()]
-                if letters:
-                    ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
-                    if ratio >= 0.8:
-                        candidate = ln
-                        break
-    if not candidate:
-        candidate = "Unknown"
-    meta["Person"] = candidate
+    if not meta["Person"]:
+        meta["Person"] = "Unknown"
     return meta
 
-# --- Main PDF Processing Function ---
+# --- Main PDF Processing ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     charges = extract_charges_from_pdf(file_io)
     meta = extract_metadata_from_pdf(file_io)
     user_id = get_user_id(meta["Person"])
 
-    # Check for duplicate bill using Bill_Hash.
+    # Check for duplicate using bill_hash.
     existing = get_all_records_safe(worksheet)
     bill_id = None
     for row in existing:
@@ -185,34 +176,30 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build output row with base columns.
+    # Build the output row: base fields plus any charge fields that have non-empty values.
     output = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
         "Bill_Month_Year": meta["Bill_Month_Year"],
         "Bill_Hash": bill_hash
     }
-
-    # For each charge, add columns only if value is non-empty.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
-            amount_col = mapped + " Amount"
-            rate_col = mapped + " Rate"
-            output[amount_col] = ch["Amount"]
+            amt_col = f"{mapped} Amount"
+            rate_col = f"{mapped} Rate"
+            output[amt_col] = ch["Amount"]
             if ch["Rate"]:
                 output[rate_col] = ch["Rate"]
-
     return output
 
 def append_row_to_sheet(row_dict):
-    # Get existing records from the sheet.
     existing = get_all_records_safe(worksheet)
     if existing:
         headers = list(existing[0].keys())
     else:
         headers = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"]
-    # Only add new columns if the value is non-empty.
+    # Add only new keys that have a non-empty value.
     for key, val in row_dict.items():
         if key not in headers and val != "":
             headers.append(key)
@@ -236,7 +223,6 @@ uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multipl
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
-    # Duplicate detection using bill hash.
     bill_hash = hashlib.md5(file_bytes).hexdigest()
     existing = get_all_records_safe(worksheet)
     if any(r.get("Bill_Hash") == bill_hash for r in existing):
