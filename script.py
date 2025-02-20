@@ -23,9 +23,22 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 try:
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 except Exception as e:
-    st.error("Error accessing the Google Sheet: " + str(e))
+    st.error("Error opening spreadsheet: " + str(e))
     st.stop()
 worksheet = spreadsheet.sheet1
+
+# --- Safe Function to Get All Records ---
+def get_all_records_safe(ws):
+    try:
+        return ws.get_all_records()
+    except Exception as e:
+        st.error("Error fetching records with get_all_records: " + str(e))
+        # Fallback: use get_all_values() and convert to dicts.
+        data = ws.get_all_values()
+        if data and len(data) > 1:
+            headers = data[0]
+            return [dict(zip(headers, row)) for row in data[1:]]
+        return []
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
@@ -71,17 +84,11 @@ def extract_charges_from_pdf(file_bytes):
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
-    """
-    Attempt to extract metadata (bill month-year and person’s name) from page 1.
-    If not found, prompt the user to enter the missing information.
-    """
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
-        # Get non-empty lines
         lines = [line.strip() for line in text.splitlines() if line.strip()]
     
-    # Try to find a date in the format "January 2024"
     month_regex = r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$"
     found = False
     for i, line in enumerate(lines):
@@ -91,22 +98,18 @@ def extract_metadata_from_pdf(file_bytes):
                 metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
             except Exception:
                 metadata["Bill_Month_Year"] = line
-            # Assume the next non-empty line is the person's name
+            # Assume the next non-empty line is the person's name.
             if i + 1 < len(lines):
                 metadata["Person"] = lines[i + 1]
             found = True
             break
-    
-    # If not found, prompt the user
     if not metadata["Bill_Month_Year"]:
         metadata["Bill_Month_Year"] = st.text_input("Enter the bill month and year (MM-YYYY):")
     if not metadata["Person"]:
         metadata["Person"] = st.text_input("Enter your name:")
-    
     return metadata
 
 # --- Mapping Persistence Functions ---
-# We store a mapping from Person to User_ID in session state.
 def load_customer_ids(mapping_path):
     if os.path.exists(mapping_path):
         df_map = pd.read_csv(mapping_path)
@@ -138,7 +141,6 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Load or initialize customer_ids mapping.
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = load_customer_ids(MAPPING_PATH)
     
@@ -150,8 +152,7 @@ def process_pdf(file_io):
         st.session_state.customer_ids[person] = user_id
         save_customer_ids(st.session_state.customer_ids, MAPPING_PATH)
     
-    # Check for duplicate bill in Google Sheets.
-    existing = worksheet.get_all_records()
+    existing = get_all_records_safe(worksheet)
     bill_id = None
     for row in existing:
         if row.get("Bill_Hash") == bill_hash:
@@ -174,7 +175,7 @@ def process_pdf(file_io):
     return output_row
 
 def append_row_to_sheet(row_dict):
-    existing = worksheet.get_all_records()
+    existing = get_all_records_safe(worksheet)
     if existing:
         headers = list(existing[0].keys())
     else:
@@ -187,11 +188,22 @@ def append_row_to_sheet(row_dict):
     row_values = [str(row_dict.get(h, "")) for h in headers]
     worksheet.append_row(row_values)
 
+# --- Safe function to get all records ---
+def get_all_records_safe(ws):
+    try:
+        return ws.get_all_records()
+    except Exception as e:
+        st.error("Error fetching records: " + str(e))
+        data = ws.get_all_values()
+        if data and len(data) > 1:
+            headers = data[0]
+            return [dict(zip(headers, row)) for row in data[1:]]
+        return []
+
 # --- Streamlit App Interface ---
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
 
-# Privacy Disclaimer
 st.markdown("""
 **Privacy Disclaimer:**  
 By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power.  
@@ -204,9 +216,8 @@ uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multipl
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     file_io = io.BytesIO(file_bytes)
-    # Duplicate detection via bill hash.
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    existing = worksheet.get_all_records()
+    existing = get_all_records_safe(worksheet)
     duplicate = any(r.get("Bill_Hash") == bill_hash for r in existing)
     if duplicate:
         st.warning("This bill has already been uploaded. Duplicate not added.")
