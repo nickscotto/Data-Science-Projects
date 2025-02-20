@@ -67,12 +67,12 @@ def get_user_id(name):
     name = name.strip() or "Unknown"
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
-# --- Charge Table Extraction ---
+# --- Extract Charge Tables Using Header Anchor ---
 def extract_charge_tables(file_bytes):
     """
-    Scans every page for a header line containing "type of charge" and "amount".
-    For each header found, collects subsequent lines until a line that seems to be outside the table.
-    Returns a list of lists (each inner list is one table of charge lines).
+    Scans every page for the header "Type of charge  How we calculate this charge  Amount($)".
+    When found, collects subsequent non-empty lines as part of that table.
+    Returns a list of tables (each a list of lines).
     """
     tables = []
     with pdfplumber.open(file_bytes) as pdf:
@@ -81,34 +81,35 @@ def extract_charge_tables(file_bytes):
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             i = 0
             while i < len(lines):
-                line = lines[i]
-                if "type of charge" in line.lower() and "amount" in line.lower():
-                    # Found header: now collect subsequent lines as table rows.
-                    table = []
+                # Look for header anchor (case-insensitive)
+                if ("type of charge" in lines[i].lower() and
+                    "how we calculate" in lines[i].lower() and
+                    "amount($" in lines[i].lower()):
+                    table_lines = []
                     i += 1
+                    # Collect lines until a blank or a line that looks not part of the table.
                     while i < len(lines):
                         curr = lines[i]
-                        # Heuristic: if the line is too short or doesn't contain numbers or "kWh", assume end of table.
-                        if len(curr) < 3 or (not re.search(r"\d", curr) and "kwh" not in curr.lower()):
+                        # Stop if we hit a line that's clearly not part of the table.
+                        # Here we stop if the line is very short.
+                        if len(curr) < 3:
                             break
-                        table.append(curr)
+                        table_lines.append(curr)
                         i += 1
-                    if table:
-                        tables.append(table)
+                    if table_lines:
+                        tables.append(table_lines)
                 else:
                     i += 1
     return tables
 
 def parse_charge_line(line):
     """
-    Attempts to parse a charge line using two patterns:
-      Pattern 1: <desc> [X $<rate> per kWh] <amount>
-      Pattern 2: <desc> $<amount>
-    Returns a dict with keys "desc", "rate", "amount" or None if no match.
+    Attempts to parse a line from a charge table.
+    Pattern: <description> [X $<rate> per kWh] <amount>
+    If the rate part is missing, it uses a simpler pattern: <description> $<amount>
+    Returns a dict with keys "desc", "rate", and "amount" (as float), or None.
     """
-    pattern1 = (
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
-    )
+    pattern1 = (r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$")
     pattern2 = r"^(?P<desc>.+?)\s+\$(?P<amount>[\d,\.]+)$"
     m = re.match(pattern1, line)
     if not m:
@@ -124,10 +125,12 @@ def parse_charge_line(line):
         return {"desc": raw_desc, "rate": rate_val, "amount": amt_val}
     return None
 
-def extract_charges_from_pdf(file_bytes):
+def extract_charges(file_bytes):
     """
-    Uses extract_charge_tables() to obtain all tables and then parses each charge line.
-    Only returns charges that map to a known standardized description.
+    Uses extract_charge_tables to obtain all tables,
+    then parses each line with parse_charge_line.
+    Only includes charges where the description maps to a known type.
+    Returns a list of charges with standardized "Mapped", "Rate", and "Amount".
     """
     tables = extract_charge_tables(file_bytes)
     charges = []
@@ -135,7 +138,7 @@ def extract_charges_from_pdf(file_bytes):
         for line in table:
             parsed = parse_charge_line(line)
             if parsed:
-                # Remove digits from "kWh" portions for cleaning.
+                # Clean the description: remove digits before 'kWh'
                 cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", parsed["desc"], flags=re.IGNORECASE).strip()
                 mapped = map_charge_description(cleaned_desc)
                 if mapped:
@@ -149,16 +152,15 @@ def extract_charges_from_pdf(file_bytes):
 # --- Metadata Extraction ---
 def extract_metadata_from_pdf(file_bytes):
     """
-    Extracts the bill date and a candidate name from page 1.
-    Searches for date patterns anywhere in each line and, once found,
-    looks among subsequent lines for a candidate that seems like a name.
+    Extracts Bill_Month_Year and a candidate Person from page 1.
+    Searches all non-empty lines using multiple date patterns.
+    Returns a dict with keys "Bill_Month_Year" and "Person".
     """
     meta = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     
-    # Define multiple date patterns.
     patterns = [
         (r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}", "%B %Y"),
         (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}", "%b %Y"),
@@ -184,11 +186,10 @@ def extract_metadata_from_pdf(file_bytes):
         if date_found:
             break
 
-    # Look for a candidate name after the date header.
+    # Look for a candidate name among lines following the date header.
     candidate = ""
     if date_idx is not None:
         for ln in lines[date_idx+1:]:
-            # Skip lines with common billing words.
             if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary", "total"]):
                 continue
             if " " in ln:
@@ -204,7 +205,7 @@ def extract_metadata_from_pdf(file_bytes):
 # --- Main PDF Processing ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    charges = extract_charges_from_pdf(file_io)
+    charges = extract_charges(file_io)
     meta = extract_metadata_from_pdf(file_io)
     user_id = get_user_id(meta["Person"])
 
@@ -218,14 +219,12 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build the output row (always include the four base fields).
     output = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
         "Bill_Month_Year": meta["Bill_Month_Year"],
         "Bill_Hash": bill_hash
     }
-    # For each recognized charge, only add a column if the value exists.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
@@ -242,7 +241,6 @@ def append_row_to_sheet(row_dict):
         headers = list(existing[0].keys())
     else:
         headers = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"]
-    # Only add new columns if they have a non-empty value.
     for key, val in row_dict.items():
         if key not in headers and val != "":
             headers.append(key)
