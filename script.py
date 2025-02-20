@@ -11,13 +11,10 @@ from google.oauth2.service_account import Credentials
 import logging
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Google Sheets Setup ---
-scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
@@ -45,32 +42,16 @@ CHARGE_TYPE_MAP = {
     "myp adjustment": "MYP Adjustment"
 }
 
-# Define the complete set of expected output keys in the desired order
 EXPECTED_HEADERS = [
-    "User_ID",
-    "Bill_ID",
-    "Bill_Month_Year",
-    "Bill_Hash",
-    "Customer Charge Amount",
-    "Distribution Charge Amount",
-    "Distribution Charge Rate",
-    "MYP Adjustment Amount",
-    "MYP Adjustment Rate",
-    "Environmental Surcharge Amount",
-    "Environmental Surcharge Rate",
-    "EmPOWER Maryland Charge Amount",
-    "EmPOWER Maryland Charge Rate",
-    "Administrative Credit Amount",
-    "Universal Service Program Amount",
-    "MD Franchise Tax Amount",
-    "MD Franchise Tax Rate",
-    "Total Electric Delivery Charges Amount",
-    "Standard Offer Service & Transmission Amount",
-    "Standard Offer Service & Transmission Rate",
-    "Procurement Cost Adjustment Amount",
-    "Procurement Cost Adjustment Rate",
-    "Total Electric Supply Charges Amount",
-    "Total Electric Charges - Residential Service Amount"
+    "User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash",
+    "Customer Charge Amount", "Distribution Charge Amount", "Distribution Charge Rate",
+    "MYP Adjustment Amount", "MYP Adjustment Rate", "Environmental Surcharge Amount",
+    "Environmental Surcharge Rate", "EmPOWER Maryland Charge Amount", "EmPOWER Maryland Charge Rate",
+    "Administrative Credit Amount", "Universal Service Program Amount", "MD Franchise Tax Amount",
+    "MD Franchise Tax Rate", "Total Electric Delivery Charges Amount",
+    "Standard Offer Service & Transmission Amount", "Standard Offer Service & Transmission Rate",
+    "Procurement Cost Adjustment Amount", "Procurement Cost Adjustment Rate",
+    "Total Electric Supply Charges Amount", "Total Electric Charges - Residential Service Amount"
 ]
 
 # --- Utility Functions ---
@@ -79,19 +60,6 @@ def get_all_records_safe(ws):
         return ws.get_all_records()
     except Exception as e:
         st.error("Error fetching records: " + str(e))
-        data = ws.get_all_values()
-        if data and len(data) > 1:
-            headers = data[0]
-            seen = {}
-            unique_headers = []
-            for h in headers:
-                if h in seen:
-                    seen[h] += 1
-                    unique_headers.append(f"{h}_{seen[h]}")
-                else:
-                    seen[h] = 0
-                    unique_headers.append(h)
-            return [dict(zip(unique_headers, row)) for row in data[1:]]
         return []
 
 def map_charge_description(desc):
@@ -109,10 +77,9 @@ def get_user_id(name):
 # --- Parsing and Extraction Functions ---
 def parse_charge_line(line):
     patterns = [
-        # Pattern for lines with kWh calculation (e.g., "95 kWh X $0.0600150 per kWh 5.70")
         r"^(?P<desc>.+?)(?:\s+\d+\s*kWh\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,\.]+)$",
-        # Pattern for simple amount lines (e.g., "Customer Charge 9.19")
-        r"^(?P<desc>.+?)\s+\$(?P<amount>-?[\d,\.]+)$"
+        r"^(?P<desc>.+?)\s+\$(?P<amount>-?[\d,\.]+)$",
+        r"^(?P<desc>.+?)(?:\s+\d+\s*kWh\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+-?(?P<amount>[\d,\.]+)$"
     ]
     
     for pattern in patterns:
@@ -126,6 +93,7 @@ def parse_charge_line(line):
                 return {"desc": raw_desc, "rate": rate_val, "amount": amt_val}
             except ValueError:
                 continue
+    logging.debug(f"Failed to parse line: {line}")
     return None
 
 def extract_charge_tables(file_bytes):
@@ -170,19 +138,23 @@ def extract_charge_tables(file_bytes):
 
 def extract_charges(file_bytes):
     tables = extract_charge_tables(file_bytes)
-    charges = []
+    charges_dict = {}
     
     for table in tables:
         for parsed in table:
             cleaned_desc = re.sub(r"\d+\s*kWh", "", parsed["desc"], flags=re.IGNORECASE).strip()
             mapped = map_charge_description(cleaned_desc)
             if mapped:
-                charges.append({
-                    "Mapped": mapped,
-                    "Rate": parsed["rate"],
-                    "Amount": parsed["amount"]
-                })
+                if mapped in charges_dict:
+                    charges_dict[mapped]["Amount"] += parsed["amount"]
+                else:
+                    charges_dict[mapped] = {
+                        "Mapped": mapped,
+                        "Rate": parsed["rate"],
+                        "Amount": parsed["amount"]
+                    }
     
+    charges = list(charges_dict.values())
     verify_charges(charges)
     return charges
 
@@ -261,9 +233,9 @@ def process_pdf(file_io):
         if mapped:
             amt_key = f"{mapped} Amount"
             rate_key = f"{mapped} Rate"
-            if amt_key in output:
+            if amt_key in output and not output[amt_key]:
                 output[amt_key] = ch["Amount"]
-            if ch["Rate"] and rate_key in output:
+            if ch["Rate"] and rate_key in output and not output[rate_key]:
                 output[rate_key] = ch["Rate"]
     return output
 
@@ -297,6 +269,10 @@ if uploaded_file is not None:
     if any(r.get("Bill_Hash") == bill_hash for r in existing):
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
-        output_row = process_pdf(io.BytesIO(file_bytes))
-        append_row_to_sheet(output_row)
-        st.success("Thank you for your contribution!")
+        with st.spinner("Processing PDF..."):
+            output_row = process_pdf(io.BytesIO(file_bytes))
+            append_row_to_sheet(output_row)
+            st.success("Thank you for your contribution!")
+            for record in logging.getLogger().handlers[0].buffer:
+                if record.levelno >= logging.WARNING:
+                    st.warning(record.getMessage())
