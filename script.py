@@ -22,10 +22,17 @@ worksheet = spreadsheet.sheet1
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
-    return re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type, flags=re.IGNORECASE).strip()
+    """
+    Standardizes charge type names by removing distinctions like 'First', 'Last', 'Next',
+    and numbers before 'kWh', ensuring similar charges are grouped together.
+    """
+    charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
+    charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+    return charge_type
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
+    """Extracts charge details from the PDF bill."""
     rows = []
     regex_pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?"
@@ -64,6 +71,7 @@ def extract_charges_from_pdf(file_bytes):
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
+    """Extracts metadata like bill month and person from the PDF bill."""
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
@@ -87,11 +95,13 @@ def extract_metadata_from_pdf(file_bytes):
 
 # --- Main PDF Processing Function ---
 def process_pdf(file_io):
+    """Processes the PDF bill, consolidating charges and preparing row data."""
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     
+    # Consolidate charges with standardized types
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -104,6 +114,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
+    # Assign or retrieve User_ID
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
     person = metadata.get("Person", "")
@@ -113,6 +124,7 @@ def process_pdf(file_io):
         user_id = str(uuid.uuid4())
         st.session_state.customer_ids[person] = user_id
     
+    # Check for existing bill and assign Bill_ID
     existing = worksheet.get_all_records()
     bill_id = None
     for row in existing:
@@ -122,12 +134,14 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
     
+    # Build output row with metadata first
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
         "Bill_Month_Year": metadata.get("Bill_Month_Year", ""),
         "Bill_Hash": bill_hash
     }
+    # Add consolidated charge data
     for ct, data in consolidated.items():
         if data["Amount"] != 0:
             output_row[f"{ct} Amount"] = data["Amount"]
@@ -137,7 +151,11 @@ def process_pdf(file_io):
 
 # --- Updated Sheet Append Function ---
 def append_row_to_sheet(row_dict):
-    # Get current headers from the sheet (or initialize if empty)
+    """Appends a row to the Google Sheet with a consistent column order."""
+    # Define fixed metadata columns
+    metadata_columns = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"]
+    
+    # Get current sheet data
     current_data = worksheet.get_all_values()
     if current_data:
         headers = current_data[0]  # First row is headers
@@ -146,22 +164,28 @@ def append_row_to_sheet(row_dict):
         headers = []
         existing_rows = []
 
-    # Update headers with any new columns from row_dict
-    new_headers = set(row_dict.keys()) - set(headers)
-    if new_headers:
-        headers.extend(sorted(new_headers))  # Sort for consistency
-        # Update the header row in the sheet
-        worksheet.update("A1", [headers])
-        # Pad existing rows with empty strings for new columns
-        if existing_rows:
-            for i, row in enumerate(existing_rows, start=2):  # Start at row 2
-                row.extend([""] * len(new_headers))
-                worksheet.update(f"A{i}", [row])
-
-    # Prepare the new row with values aligned to the full header set
-    row_values = [str(row_dict.get(header, "")) for header in headers]
+    # Collect and sort charge-related columns
+    charge_columns = [col for col in row_dict.keys() if col not in metadata_columns]
+    existing_charge_columns = [col for col in headers if col not in metadata_columns]
+    new_charge_columns = list(set(charge_columns) - set(existing_charge_columns))
+    all_charge_columns = sorted(existing_charge_columns + new_charge_columns)
     
-    # Append the new row
+    # Define full headers: metadata followed by sorted charge columns
+    full_headers = metadata_columns + all_charge_columns
+    
+    # Update sheet headers if changed
+    if full_headers != headers:
+        worksheet.update("A1", [full_headers])
+        
+        # Pad existing rows for new columns
+        if existing_rows:
+            for i, row in enumerate(existing_rows, start=2):
+                row_dict = dict(zip(headers, row))
+                padded_row = [str(row_dict.get(header, "")) for header in full_headers]
+                worksheet.update(f"A{i}", [padded_row])
+    
+    # Prepare and append the new row
+    row_values = [str(row_dict.get(header, "")) for header in full_headers]
     worksheet.append_row(row_values)
 
 # --- Streamlit App Interface ---
