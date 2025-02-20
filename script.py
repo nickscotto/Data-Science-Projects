@@ -27,13 +27,12 @@ except Exception as e:
     st.stop()
 worksheet = spreadsheet.sheet1
 
-# --- Safe Function to Get All Records ---
+# --- Safe function to get all records with expected headers ---
 def get_all_records_safe(ws):
     try:
-        return ws.get_all_records()
+        return ws.get_all_records(expected_headers=["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"])
     except Exception as e:
-        st.error("Error fetching records with get_all_records: " + str(e))
-        # Fallback: use get_all_values() and convert to dicts.
+        st.error("Error fetching records: " + str(e))
         data = ws.get_all_values()
         if data and len(data) > 1:
             headers = data[0]
@@ -84,29 +83,41 @@ def extract_charges_from_pdf(file_bytes):
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
+    """
+    Attempt to extract metadata (Bill_Month_Year and Person) from page 1.
+    Supports full month names (e.g., "January 2024") and abbreviated (e.g., "Jan 2024").
+    If not found, defaults to empty strings.
+    """
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
     
-    month_regex = r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$"
-    found = False
+    # Define date patterns.
+    date_patterns = [
+        r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$",
+        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.? \d{4}$"
+    ]
+    
     for i, line in enumerate(lines):
-        if re.match(month_regex, line, re.IGNORECASE):
-            try:
-                parsed_date = datetime.strptime(line, "%B %Y")
-                metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
-            except Exception:
-                metadata["Bill_Month_Year"] = line
-            # Assume the next non-empty line is the person's name.
-            if i + 1 < len(lines):
-                metadata["Person"] = lines[i + 1]
-            found = True
+        for pattern in date_patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                try:
+                    try:
+                        parsed_date = datetime.strptime(line, "%B %Y")
+                    except Exception:
+                        parsed_date = datetime.strptime(line, "%b %Y")
+                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
+                except Exception:
+                    metadata["Bill_Month_Year"] = line
+                # Use the next non-empty line as the person's name.
+                if i + 1 < len(lines):
+                    metadata["Person"] = lines[i+1]
+                break
+        if metadata["Bill_Month_Year"]:
             break
-    if not metadata["Bill_Month_Year"]:
-        metadata["Bill_Month_Year"] = st.text_input("Enter the bill month and year (MM-YYYY):")
-    if not metadata["Person"]:
-        metadata["Person"] = st.text_input("Enter your name:")
+    
+    # Do not prompt the user; leave as empty string if not found.
     return metadata
 
 # --- Mapping Persistence Functions ---
@@ -141,6 +152,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
+    # Load or initialize persistent customer IDs.
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = load_customer_ids(MAPPING_PATH)
     
@@ -191,7 +203,7 @@ def append_row_to_sheet(row_dict):
 # --- Safe function to get all records ---
 def get_all_records_safe(ws):
     try:
-        return ws.get_all_records()
+        return ws.get_all_records(expected_headers=["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"])
     except Exception as e:
         st.error("Error fetching records: " + str(e))
         data = ws.get_all_values()
