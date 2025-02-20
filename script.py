@@ -1,6 +1,5 @@
 import streamlit as st
 import io
-import os
 import re
 import uuid
 import hashlib
@@ -18,26 +17,21 @@ scope = [
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 
-# Use the spreadsheet ID to open your Google Sheet.
+# Use your spreadsheet ID (the sheet must be shared with your service account)
 SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
-try:
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-except Exception as e:
-    st.error("Error opening spreadsheet: " + str(e))
-    st.stop()
-worksheet = spreadsheet.sheet1
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-# --- Safe function to get all records with expected headers ---
-def get_all_records_safe(ws):
+def get_or_create_worksheet(spreadsheet, title):
+    """Return a worksheet with the given title; create it if it doesn't exist."""
     try:
-        return ws.get_all_records(expected_headers=["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"])
-    except Exception as e:
-        st.error("Error fetching records: " + str(e))
-        data = ws.get_all_values()
-        if data and len(data) > 1:
-            headers = data[0]
-            return [dict(zip(headers, row)) for row in data[1:]]
-        return []
+        ws = spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols="50")
+    return ws
+
+# Get (or create) the two worksheets:
+bill_ws = get_or_create_worksheet(spreadsheet, "Bill_Data")
+mapping_ws = get_or_create_worksheet(spreadsheet, "Mapping")
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
@@ -83,20 +77,15 @@ def extract_charges_from_pdf(file_bytes):
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
-    """
-    Attempt to extract metadata (Bill_Month_Year and Person) from page 1.
-    Supports full month names (e.g., "January 2024") and abbreviated (e.g., "Jan 2024").
-    If not found, defaults to empty strings.
-    """
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
     
-    # Define date patterns.
+    # Define date patterns (full and abbreviated month names)
     date_patterns = [
         r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$",
-        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.? \d{4}$"
+        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}$"
     ]
     
     for i, line in enumerate(lines):
@@ -110,33 +99,42 @@ def extract_metadata_from_pdf(file_bytes):
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
                 except Exception:
                     metadata["Bill_Month_Year"] = line
-                # Use the next non-empty line as the person's name.
+                # Use the next non-empty line as the person's name (if available)
                 if i + 1 < len(lines):
                     metadata["Person"] = lines[i+1]
                 break
         if metadata["Bill_Month_Year"]:
             break
-    
-    # Do not prompt the user; leave as empty string if not found.
+    # Do not prompt the user; if not found, leave as empty string.
     return metadata
 
-# --- Mapping Persistence Functions ---
-def load_customer_ids(mapping_path):
-    if os.path.exists(mapping_path):
-        df_map = pd.read_csv(mapping_path)
-        return dict(zip(df_map["Person"], df_map["User_ID"]))
-    else:
-        return {}
+# --- Mapping Persistence in Google Sheets ---
+def load_customer_ids(ws):
+    """Load the Person-to-User_ID mapping from the Mapping worksheet."""
+    try:
+        data = ws.get_all_records()
+        if data:
+            return {row["Person"]: row["User_ID"] for row in data if row.get("Person") and row.get("User_ID")}
+    except Exception as e:
+        st.error("Error loading customer IDs: " + str(e))
+    return {}
 
-def save_customer_ids(mapping, mapping_path):
-    df_map = pd.DataFrame(mapping.items(), columns=["Person", "User_ID"])
-    os.makedirs(os.path.dirname(mapping_path) or ".", exist_ok=True)
-    df_map.to_csv(mapping_path, index=False)
+def save_customer_ids(ws, mapping):
+    """Save the Person-to-User_ID mapping to the Mapping worksheet.
+       Overwrites the entire worksheet.
+    """
+    # Prepare header and data rows.
+    header = ["Person", "User_ID"]
+    rows = [header]
+    for person, user_id in mapping.items():
+        rows.append([person, user_id])
+    ws.clear()
+    for row in rows:
+        ws.append_row(row)
 
 # --- Main PDF Processing Function ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     
@@ -152,9 +150,9 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Load or initialize persistent customer IDs.
+    # Load or initialize customer_ids mapping from Mapping worksheet.
     if "customer_ids" not in st.session_state:
-        st.session_state.customer_ids = load_customer_ids(MAPPING_PATH)
+        st.session_state.customer_ids = load_customer_ids(mapping_ws)
     
     person = metadata.get("Person", "")
     if person in st.session_state.customer_ids:
@@ -162,9 +160,10 @@ def process_pdf(file_io):
     else:
         user_id = str(uuid.uuid4())
         st.session_state.customer_ids[person] = user_id
-        save_customer_ids(st.session_state.customer_ids, MAPPING_PATH)
+        save_customer_ids(mapping_ws, st.session_state.customer_ids)
     
-    existing = get_all_records_safe(worksheet)
+    # Check for duplicate bill using Bill_Hash in Bill_Data worksheet.
+    existing = bill_ws.get_all_records()
     bill_id = None
     for row in existing:
         if row.get("Bill_Hash") == bill_hash:
@@ -186,8 +185,8 @@ def process_pdf(file_io):
             output_row[f"{ct} Rate"] = data["Rate"]
     return output_row
 
-def append_row_to_sheet(row_dict):
-    existing = get_all_records_safe(worksheet)
+def append_row_to_sheet(ws, row_dict):
+    existing = ws.get_all_records()
     if existing:
         headers = list(existing[0].keys())
     else:
@@ -196,21 +195,9 @@ def append_row_to_sheet(row_dict):
         if key not in headers:
             headers.append(key)
     if not existing:
-        worksheet.append_row(headers)
+        ws.append_row(headers)
     row_values = [str(row_dict.get(h, "")) for h in headers]
-    worksheet.append_row(row_values)
-
-# --- Safe function to get all records ---
-def get_all_records_safe(ws):
-    try:
-        return ws.get_all_records(expected_headers=["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"])
-    except Exception as e:
-        st.error("Error fetching records: " + str(e))
-        data = ws.get_all_values()
-        if data and len(data) > 1:
-            headers = data[0]
-            return [dict(zip(headers, row)) for row in data[1:]]
-        return []
+    ws.append_row(row_values)
 
 # --- Streamlit App Interface ---
 st.title("Delmarva BillWatch")
@@ -229,11 +216,11 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     file_io = io.BytesIO(file_bytes)
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    existing = get_all_records_safe(worksheet)
+    existing = bill_ws.get_all_records()
     duplicate = any(r.get("Bill_Hash") == bill_hash for r in existing)
     if duplicate:
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
         output_row = process_pdf(file_io)
-        append_row_to_sheet(output_row)
+        append_row_to_sheet(bill_ws, output_row)
         st.success("Thank you for your contribution!")
