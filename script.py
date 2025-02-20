@@ -37,37 +37,11 @@ CHARGE_TYPE_MAP = {
     "total electric charges - residential service": "Total Electric Charges - Residential Service"
 }
 
-# The final columns in a stable order
-ORDERED_COLUMNS = [
-    "User_ID",
-    "Bill_ID",
-    "Bill_Month_Year",
-    "Bill_Hash",
-    "Customer Charge Amount",
-    "Customer Charge Rate",
-    "Distribution Charge First kWh Amount",
-    "Distribution Charge First kWh Rate",
-    "Distribution Charge Last kWh Amount",
-    "Distribution Charge Last kWh Rate",
-    "Environmental Surcharge kWh Amount",
-    "Environmental Surcharge kWh Rate",
-    "EmPOWER Maryland kWh Amount",
-    "EmPOWER Maryland kWh Rate",
-    "Universal Service Program Amount",
-    "MD Franchise Tax kWh Amount",
-    "MD Franchise Tax kWh Rate",
-    "Total Electric Delivery Charges Amount",
-    "Transmission First kWh Amount",
-    "Transmission First kWh Rate",
-    "Transmission Last kWh Amount",
-    "Transmission Last kWh Rate",
-    "Adjustment kWh Amount",
-    "Adjustment kWh Rate",
-    "Total Electric Supply Charges Amount",
-    "Total Electric Charges - Residential Service Amount"
-]
-
 def get_all_records_safe(ws):
+    """
+    Retrieves all records from the sheet as a list of dicts.
+    If there's an error, we fallback to get_all_values.
+    """
     try:
         return ws.get_all_records()
     except Exception as e:
@@ -81,7 +55,7 @@ def get_all_records_safe(ws):
 def map_charge_description(desc):
     """
     Return a standardized charge name by matching partial strings from CHARGE_TYPE_MAP.
-    If none match, return None.
+    If none match, return None so we skip it.
     """
     desc_lower = desc.lower()
     for partial, standard in CHARGE_TYPE_MAP.items():
@@ -95,14 +69,6 @@ def get_user_id(name):
     if not name:
         return str(uuid.uuid4())
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
-
-def standardize_charge_type(charge_type):
-    """
-    Remove numeric kWh values from textual desc, e.g. 'Distribution Charge Last 2190 kWh' -> 'Distribution Charge Last kWh'
-    Then map it using map_charge_description
-    """
-    cleaned = re.sub(r"\d+\s*kWh", "kWh", charge_type, flags=re.IGNORECASE)
-    return cleaned.strip()
 
 def extract_charges_from_pdf(file_bytes):
     """
@@ -133,9 +99,8 @@ def extract_charges_from_pdf(file_bytes):
                             amount_val = float(amount_str)
                         except ValueError:
                             continue
-                        # standardize & map
-                        cleaned_desc = standardize_charge_type(raw_desc)
-                        mapped = map_charge_description(cleaned_desc)
+                        # map the description
+                        mapped = map_charge_description(raw_desc)
                         if mapped:
                             charges.append({
                                 "Mapped": mapped,
@@ -146,8 +111,7 @@ def extract_charges_from_pdf(file_bytes):
 
 def extract_metadata_from_pdf(file_bytes):
     """
-    Extract date from page 1 using multiple patterns. 
-    Then look for uppercase line afterwards as a name, else 'Unknown'.
+    Extract date from page 1 using multiple patterns, plus a heuristic for name if available.
     """
     meta = {"Bill_Month_Year": "", "Person": ""}
     date_patterns = [
@@ -176,11 +140,10 @@ def extract_metadata_from_pdf(file_bytes):
         if date_found:
             break
 
-    # Attempt name extraction in subsequent lines
+    # Attempt name extraction
     name_candidate = ""
     if date_idx is not None:
         for ln in lines[date_idx+1:]:
-            # skip lines with typical billing words
             if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary"]):
                 continue
             letters = [ch for ch in ln if ch.isalpha()]
@@ -194,6 +157,7 @@ def extract_metadata_from_pdf(file_bytes):
     return meta
 
 def process_pdf(file_io):
+    import hashlib
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     charges = extract_charges_from_pdf(file_io)
     meta = extract_metadata_from_pdf(file_io)
@@ -209,21 +173,23 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build output row
+    # Build output row with minimal base columns
     output = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
         "Bill_Month_Year": meta["Bill_Month_Year"],
         "Bill_Hash": bill_hash
     }
-    # Fill in recognized charges
+
+    # For each recognized charge, place it in "X Amount" / "X Rate"
     for ch in charges:
-        mapped_name = ch["Mapped"]  # e.g. 'Distribution Charge First kWh'
-        amount_col = mapped_name + " Amount"
-        rate_col   = mapped_name + " Rate"
-        output[amount_col] = ch["Amount"]
-        if ch["Rate"]:
-            output[rate_col] = ch["Rate"]
+        mapped_name = ch["Mapped"]
+        if mapped_name:
+            amount_col = mapped_name + " Amount"
+            rate_col   = mapped_name + " Rate"
+            output[amount_col] = ch["Amount"]
+            if ch["Rate"]:
+                output[rate_col] = ch["Rate"]
 
     return output
 
@@ -232,26 +198,22 @@ def append_row_to_sheet(row_dict):
     if existing:
         headers = list(existing[0].keys())
     else:
-        headers = []
+        # If empty, start with the 4 main columns
+        headers = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"]
 
-    # Merge ORDERED_COLUMNS with existing
-    final_headers = list(headers)
-    for col in ORDERED_COLUMNS:
-        if col not in final_headers:
-            final_headers.append(col)
-    # also add any new columns from row_dict if not in final_headers
-    for key in row_dict.keys():
-        if key not in final_headers:
-            final_headers.append(key)
+    # Add new columns only if they have a non-empty value
+    for key, val in row_dict.items():
+        if key not in headers and val != "":
+            headers.append(key)
 
-    # if empty, append final_headers
+    # If sheet was empty, append the new headers
     if not existing:
-        worksheet.append_row(final_headers)
+        worksheet.append_row(headers)
 
+    # Build row in order of headers
     row_values = []
-    for col in final_headers:
-        val = row_dict.get(col, "")
-        row_values.append(str(val))
+    for col in headers:
+        row_values.append(str(row_dict.get(col, "")))
     worksheet.append_row(row_values)
 
 # --- Streamlit UI ---
@@ -271,6 +233,7 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     bill_hash = hashlib.md5(file_bytes).hexdigest()
     existing = get_all_records_safe(worksheet)
+    # Duplicate detection
     if any(r.get("Bill_Hash") == bill_hash for r in existing):
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
