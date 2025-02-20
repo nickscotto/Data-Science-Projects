@@ -13,10 +13,10 @@ scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
+creds = Credentials.from_service_account_info(
+    st.secrets["gcp_service_account"], scopes=scope
+)
 gc = gspread.authorize(creds)
-
-# Use your spreadsheet ID to open your sheet.
 SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 try:
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
@@ -26,7 +26,6 @@ except Exception as e:
 worksheet = spreadsheet.sheet1
 
 # --- Mapping for Charge Types ---
-# Map substrings in the charge description to standardized names.
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
     "distribution charge first": "Distribution Charge First kWh",
@@ -40,7 +39,9 @@ CHARGE_TYPE_MAP = {
     "transmission last": "Transmission Last kWh",
     "adjustment": "Adjustment kWh",
     "total electric supply charges": "Total Electric Supply Charges",
-    "total electric charges - residential service": "Total Electric Charges - Residential Service"
+    "total electric charges - residential service": "Total Electric Charges - Residential Service",
+    "delivery": "Delivery",
+    "supply": "Supply"
 }
 
 # --- Utility Functions ---
@@ -56,7 +57,6 @@ def get_all_records_safe(ws):
         return []
 
 def map_charge_description(desc):
-    """Return the standardized charge name if any key in CHARGE_TYPE_MAP appears in desc."""
     desc_lower = desc.lower()
     for partial, standard in CHARGE_TYPE_MAP.items():
         if partial in desc_lower:
@@ -64,109 +64,152 @@ def map_charge_description(desc):
     return None
 
 def get_user_id(name):
-    """Generate a deterministic User_ID by hashing the name; if blank, use a random UUID."""
     name = name.strip() or "Unknown"
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
-# --- PDF Extraction: Charges ---
-def extract_charges_from_pdf(file_bytes):
+# --- Extraction of Charge Tables Using Header Anchor ---
+def extract_charge_tables(file_bytes):
     """
-    Scan every line on pages 1 and 2 for patterns of the form:
-      <description> [X $<rate> per kWh] <amount>
-    If the description matches one of the known partial strings, add it.
+    Scan through each page and locate a header line that contains "type of charge" and "amount".
+    Then, extract subsequent lines as part of the table until a line is encountered that doesn't seem to belong.
+    Returns a list of lists (one per table).
     """
-    pattern = (
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?"
-        r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
-    )
-    charges = []
+    tables = []
     with pdfplumber.open(file_bytes) as pdf:
-        # Check pages 1 and 2 (adjust indexes if needed)
-        for page_idx in [0, 1]:
-            if page_idx < len(pdf.pages):
-                text = pdf.pages[page_idx].extract_text() or ""
-                for line in text.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    m = re.search(pattern, line)
-                    if m:
-                        raw_desc = m.group("desc").strip()
-                        rate_val = m.group("rate") or ""
-                        amt_str = m.group("amount").replace(",", "").replace("−", "")
-                        try:
-                            amt_val = float(amt_str)
-                        except ValueError:
-                            continue
-                        # Clean the description by removing digits from kWh parts.
-                        cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", raw_desc, flags=re.IGNORECASE).strip()
-                        mapped = map_charge_description(cleaned_desc)
-                        if mapped:
-                            charges.append({
-                                "Mapped": mapped,
-                                "Rate": rate_val,
-                                "Amount": amt_val
-                            })
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                # Look for header keywords.
+                if "type of charge" in line.lower() and "amount" in line.lower():
+                    # Start collecting table lines
+                    table_lines = []
+                    i += 1
+                    while i < len(lines):
+                        curr = lines[i]
+                        # Heuristic: if the line is very short or doesn't contain numbers or "kWh", consider that the table ended.
+                        if len(curr) < 3 or (not re.search(r"\d", curr) and "kwh" not in curr.lower()):
+                            break
+                        table_lines.append(curr)
+                        i += 1
+                    if table_lines:
+                        tables.append(table_lines)
+                else:
+                    i += 1
+    return tables
+
+def parse_charge_line(line):
+    """
+    Try to extract charge data from a line.
+    Two patterns:
+      1. With optional rate: <desc> [X $<rate> per kWh] <amount>
+      2. Simpler: <desc> $<amount>
+    Returns a dict with keys: "desc", "rate" (possibly empty), and "amount" as float, or None if not matched.
+    """
+    pattern1 = (
+        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
+    )
+    pattern2 = r"^(?P<desc>.+?)\s+\$(?P<amount>[\d,\.]+)$"
+    m = re.match(pattern1, line)
+    if not m:
+        m = re.match(pattern2, line)
+    if m:
+        raw_desc = m.group("desc").strip()
+        rate_val = m.group("rate") if "rate" in m.groupdict() else ""
+        amt_str = m.group("amount").replace(",", "").replace("−", "")
+        try:
+            amt_val = float(amt_str)
+        except ValueError:
+            return None
+        return {"desc": raw_desc, "rate": rate_val, "amount": amt_val}
+    return None
+
+def extract_charges(file_bytes):
+    """
+    Extract all charge entries from all tables found by extract_charge_tables.
+    For each line, parse it and map the description.
+    Returns a list of charges with standardized "Mapped", "Rate", and "Amount".
+    """
+    tables = extract_charge_tables(file_bytes)
+    charges = []
+    for table in tables:
+        for line in table:
+            parsed = parse_charge_line(line)
+            if parsed:
+                # Clean description: remove numbers before 'kWh'
+                cleaned = re.sub(r"\d+\s*kWh", "kWh", parsed["desc"], flags=re.IGNORECASE).strip()
+                mapped = map_charge_description(cleaned)
+                if mapped:
+                    charges.append({
+                        "Mapped": mapped,
+                        "Rate": parsed["rate"],
+                        "Amount": parsed["amount"]
+                    })
     return charges
 
-# --- PDF Extraction: Metadata (Date and Name) ---
+# --- Metadata Extraction ---
 def extract_metadata_from_pdf(file_bytes):
     """
-    Extract metadata from page 1:
-      - Look for any occurrence of a date in known patterns anywhere in a line.
-      - Use re.search so that extra text is allowed.
-      - Then, try to extract the person's name from a nearby line.
-      If no name is found, default to "Unknown".
+    Extract Bill_Month_Year and Person from page 1.
+    Uses multiple date patterns to find a date anywhere on the page.
+    For the person's name, looks for a candidate line after the date or among the first few lines.
     """
     meta = {"Bill_Month_Year": "", "Person": ""}
-    date_patterns = [
+    with pdfplumber.open(file_bytes) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    
+    patterns = [
         (r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}", "%B %Y"),
         (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}", "%b %Y"),
         (r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}", "%B %d, %Y"),
         (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}", "%b %d, %Y")
     ]
-    with pdfplumber.open(file_bytes) as pdf:
-        text = pdf.pages[0].extract_text() or ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     
     date_found = False
+    date_idx = None
     for i, line in enumerate(lines):
-        for pat, fmt in date_patterns:
+        for pat, fmt in patterns:
             match = re.search(pat, line, re.IGNORECASE)
             if match:
                 date_str = match.group(0)
                 try:
-                    parsed_date = datetime.strptime(date_str, fmt)
-                    meta["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
+                    parsed = datetime.strptime(date_str, fmt)
+                    meta["Bill_Month_Year"] = parsed.strftime("%m-%Y")
                 except Exception:
                     meta["Bill_Month_Year"] = date_str
                 date_found = True
-                # Look for a candidate name in subsequent lines that isn't a common billing term.
-                for ln in lines[i+1:]:
-                    if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary"]):
-                        continue
-                    if " " in ln:
-                        # If the line appears mostly uppercase, consider it a name.
-                        letters = [ch for ch in ln if ch.isalpha()]
-                        if letters and (sum(1 for ch in letters if ch.isupper()) / len(letters)) >= 0.8:
-                            meta["Person"] = ln
-                            break
+                date_idx = i
                 break
         if date_found:
             break
 
-    if not meta["Person"]:
-        meta["Person"] = "Unknown"
+    # Look for a candidate name among the lines near the date
+    candidate = ""
+    if date_idx is not None:
+        for ln in lines[date_idx+1:]:
+            if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary", "total"]):
+                continue
+            if " " in ln:
+                letters = [ch for ch in ln if ch.isalpha()]
+                if letters and (sum(1 for ch in letters if ch.isupper()) / len(letters)) >= 0.8:
+                    candidate = ln
+                    break
+    if not candidate:
+        candidate = "Unknown"
+    meta["Person"] = candidate
     return meta
 
 # --- Main PDF Processing ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    charges = extract_charges_from_pdf(file_io)
+    charges = extract_charges(file_io)
     meta = extract_metadata_from_pdf(file_io)
     user_id = get_user_id(meta["Person"])
 
-    # Check for duplicate using bill_hash.
+    # Check for duplicate bill using Bill_Hash.
     existing = get_all_records_safe(worksheet)
     bill_id = None
     for row in existing:
@@ -176,7 +219,7 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build the output row: base fields plus any charge fields that have non-empty values.
+    # Build output row (only include a column if there is a non-empty value)
     output = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
@@ -199,7 +242,6 @@ def append_row_to_sheet(row_dict):
         headers = list(existing[0].keys())
     else:
         headers = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"]
-    # Add only new keys that have a non-empty value.
     for key, val in row_dict.items():
         if key not in headers and val != "":
             headers.append(key)
