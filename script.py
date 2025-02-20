@@ -20,15 +20,13 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
-# --- Mappings ---
-# Map partial strings from the PDF to standardized keys
+# A dictionary that maps partial strings to a standard charge name
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
     "distribution charge first": "Distribution Charge First kWh",
     "distribution charge last": "Distribution Charge Last kWh",
     "environmental surcharge": "Environmental Surcharge kWh",
     "empower maryland": "EmPOWER Maryland kWh",
-    "charge kwh": "EmPOWER Maryland kWh",  # if your PDF says "Charge kWh" for EmPOWER
     "universal service program": "Universal Service Program",
     "md franchise tax": "MD Franchise Tax kWh",
     "total electric delivery charges": "Total Electric Delivery Charges",
@@ -39,7 +37,7 @@ CHARGE_TYPE_MAP = {
     "total electric charges - residential service": "Total Electric Charges - Residential Service"
 }
 
-# The final columns in the order you want them to appear
+# The final columns in a stable order
 ORDERED_COLUMNS = [
     "User_ID",
     "Bill_ID",
@@ -52,7 +50,7 @@ ORDERED_COLUMNS = [
     "Distribution Charge Last kWh Amount",
     "Distribution Charge Last kWh Rate",
     "Environmental Surcharge kWh Amount",
-    "Environmental Surcharge kwh Rate",
+    "Environmental Surcharge kWh Rate",
     "EmPOWER Maryland kWh Amount",
     "EmPOWER Maryland kWh Rate",
     "Universal Service Program Amount",
@@ -69,24 +67,7 @@ ORDERED_COLUMNS = [
     "Total Electric Charges - Residential Service Amount"
 ]
 
-# --- Utility Functions ---
-def map_charge_type(desc):
-    """
-    Given a partial description like 'Distribution Charge First 1000 kWh X $0.078...',
-    return a standardized key (e.g. 'Distribution Charge First kWh').
-    We do a fuzzy match by checking each key in CHARGE_TYPE_MAP.
-    """
-    desc_lower = desc.lower()
-    for partial, standard in CHARGE_TYPE_MAP.items():
-        if partial in desc_lower:
-            return standard
-    return None  # unrecognized
-
 def get_all_records_safe(ws):
-    """
-    Retrieve existing records with expected headers or fallback to get_all_values.
-    We won't enforce expected_headers here because we handle stable columns ourselves.
-    """
     try:
         return ws.get_all_records()
     except Exception as e:
@@ -96,6 +77,17 @@ def get_all_records_safe(ws):
             headers = data[0]
             return [dict(zip(headers, row)) for row in data[1:]]
         return []
+
+def map_charge_description(desc):
+    """
+    Return a standardized charge name by matching partial strings from CHARGE_TYPE_MAP.
+    If none match, return None.
+    """
+    desc_lower = desc.lower()
+    for partial, standard in CHARGE_TYPE_MAP.items():
+        if partial in desc_lower:
+            return standard
+    return None
 
 def get_user_id(name):
     """Deterministic ID by hashing the name. If blank, random UUID."""
@@ -106,71 +98,67 @@ def get_user_id(name):
 
 def standardize_charge_type(charge_type):
     """
-    Remove numeric kWh values from the textual desc, e.g. 'Distribution Charge Last 2190 kWh' -> 'Distribution Charge Last kWh'
-    Then map it using CHARGE_TYPE_MAP.
+    Remove numeric kWh values from textual desc, e.g. 'Distribution Charge Last 2190 kWh' -> 'Distribution Charge Last kWh'
+    Then map it using map_charge_description
     """
-    # Remove any digits + 'kWh' pattern, then map
-    # e.g. 'Distribution Charge Last 2190 kWh' -> 'Distribution Charge Last kWh'
     cleaned = re.sub(r"\d+\s*kWh", "kWh", charge_type, flags=re.IGNORECASE)
     return cleaned.strip()
 
-# --- PDF Extraction: Charges ---
 def extract_charges_from_pdf(file_bytes):
-    rows = []
-    charge_pattern = (
+    """
+    Scan every line on pages 1 & 2 for pattern: 
+      <desc> [X $<rate> per kWh] <amount>
+    Then map the desc to a standard name via map_charge_description.
+    """
+    pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?"
         r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
     )
-    import pdfplumber
+    charges = []
     with pdfplumber.open(file_bytes) as pdf:
-        # Typically pages 1-2 contain the "Type of charge" table
-        for page_index in [1, 2]:
-            if page_index < len(pdf.pages):
-                text = pdf.pages[page_index].extract_text() or ""
+        for page_idx in [1, 2]:
+            if page_idx < len(pdf.pages):
+                text = pdf.pages[page_idx].extract_text() or ""
                 lines = text.splitlines()
-                header_found = False
                 for line in lines:
                     line = line.strip()
                     if not line:
                         continue
-                    # Check if we found "Type of charge" and "Amount($" on the same line
-                    if not header_found and "Type of charge" in line.lower() and "amount($" in line.lower():
-                        header_found = True
-                        continue
-                    if header_found:
-                        m = re.match(charge_pattern, line)
-                        if m:
-                            desc = m.group("desc").strip()
-                            rate_val = m.group("rate") or ""
-                            amount_str = m.group("amount").replace(",", "").replace("−", "")
-                            try:
-                                amount_val = float(amount_str)
-                            except ValueError:
-                                continue
-                            # Now map the desc to a standardized type
-                            mapped = map_charge_type(desc)
-                            if mapped:
-                                rows.append({
-                                    "Mapped": mapped,  # e.g. 'Distribution Charge First kWh'
-                                    "Rate": rate_val,
-                                    "Amount": amount_val
-                                })
-    return rows
+                    m = re.match(pattern, line)
+                    if m:
+                        raw_desc = m.group("desc").strip()
+                        rate_val = m.group("rate") or ""
+                        amount_str = m.group("amount").replace(",", "").replace("−", "")
+                        try:
+                            amount_val = float(amount_str)
+                        except ValueError:
+                            continue
+                        # standardize & map
+                        cleaned_desc = standardize_charge_type(raw_desc)
+                        mapped = map_charge_description(cleaned_desc)
+                        if mapped:
+                            charges.append({
+                                "Mapped": mapped,
+                                "Rate": rate_val,
+                                "Amount": amount_val
+                            })
+    return charges
 
-# --- PDF Extraction: Metadata (Date, Name) ---
 def extract_metadata_from_pdf(file_bytes):
-    metadata = {"Bill_Month_Year": "", "Person": ""}
-    with pdfplumber.open(file_bytes) as pdf:
-        text = pdf.pages[0].extract_text() or ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    # Date patterns
+    """
+    Extract date from page 1 using multiple patterns. 
+    Then look for uppercase line afterwards as a name, else 'Unknown'.
+    """
+    meta = {"Bill_Month_Year": "", "Person": ""}
     date_patterns = [
         (r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$", "%B %Y"),
         (r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}$", "%b %Y"),
         (r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}$", "%B %d, %Y"),
         (r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}$", "%b %d, %Y")
     ]
+    with pdfplumber.open(file_bytes) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
     date_found = False
     date_idx = None
@@ -179,58 +167,39 @@ def extract_metadata_from_pdf(file_bytes):
             if re.match(pat, line, re.IGNORECASE):
                 try:
                     parsed = datetime.strptime(line, fmt)
-                    metadata["Bill_Month_Year"] = parsed.strftime("%m-%Y")
-                except Exception:
-                    metadata["Bill_Month_Year"] = ""  # if parse fails, keep empty
+                    meta["Bill_Month_Year"] = parsed.strftime("%m-%Y")
+                except:
+                    meta["Bill_Month_Year"] = ""
                 date_found = True
                 date_idx = i
                 break
         if date_found:
             break
 
-    # Heuristic for name: look in subsequent lines for uppercase line
-    # or just "NOURHAN SCOTTO" or something that looks like a name
+    # Attempt name extraction in subsequent lines
     name_candidate = ""
     if date_idx is not None:
         for ln in lines[date_idx+1:]:
-            if "account" in ln.lower() or "bill" in ln.lower() or "period" in ln.lower() or "address" in ln.lower():
+            # skip lines with typical billing words
+            if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary"]):
                 continue
             letters = [ch for ch in ln if ch.isalpha()]
-            # If there's at least one space and it's mostly uppercase letters
             if " " in ln and letters and all(ch.isupper() for ch in letters):
                 name_candidate = ln
                 break
     if not name_candidate:
         name_candidate = "Unknown"
+    meta["Person"] = name_candidate
 
-    metadata["Person"] = name_candidate
-    return metadata
+    return meta
 
-# --- Safe retrieval of existing sheet data ---
-def get_all_records_safe(ws):
-    try:
-        return ws.get_all_records()
-    except Exception as e:
-        st.error("Error fetching records: " + str(e))
-        data = ws.get_all_values()
-        if data and len(data) > 1:
-            headers = data[0]
-            return [dict(zip(headers, row)) for row in data[1:]]
-        return []
-
-# --- Main PDF Processing ---
 def process_pdf(file_io):
-    # Compute a bill hash for duplicates
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-
-    # Extract charges & metadata
     charges = extract_charges_from_pdf(file_io)
     meta = extract_metadata_from_pdf(file_io)
-
-    # Generate a user_id from the person's name
     user_id = get_user_id(meta["Person"])
 
-    # Check for duplicate
+    # Check for duplicates
     existing = get_all_records_safe(worksheet)
     bill_id = None
     for row in existing:
@@ -240,22 +209,18 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build an output row with stable columns
-    # Start with the 4 main fields
+    # Build output row
     output = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
         "Bill_Month_Year": meta["Bill_Month_Year"],
         "Bill_Hash": bill_hash
     }
-
-    # For each extracted charge, place it in the correct "X Amount" and "X Rate" columns
-    # according to the mapped name
+    # Fill in recognized charges
     for ch in charges:
         mapped_name = ch["Mapped"]  # e.g. 'Distribution Charge First kWh'
         amount_col = mapped_name + " Amount"
         rate_col   = mapped_name + " Rate"
-        # If they appear in your ORDERED_COLUMNS, populate them
         output[amount_col] = ch["Amount"]
         if ch["Rate"]:
             output[rate_col] = ch["Rate"]
@@ -267,27 +232,22 @@ def append_row_to_sheet(row_dict):
     if existing:
         headers = list(existing[0].keys())
     else:
-        # If sheet is empty, start with your desired ORDERED_COLUMNS
         headers = []
 
-    # We want to ensure columns appear in a stable order
-    # Merge existing headers with ORDERED_COLUMNS
-    # and also add any new columns from row_dict
+    # Merge ORDERED_COLUMNS with existing
     final_headers = list(headers)
-    # Add from ORDERED_COLUMNS first if they're not in existing
     for col in ORDERED_COLUMNS:
         if col not in final_headers:
             final_headers.append(col)
-    # Then add any new columns from row_dict if not already present
+    # also add any new columns from row_dict if not in final_headers
     for key in row_dict.keys():
         if key not in final_headers:
             final_headers.append(key)
 
-    # If the sheet was empty, append final_headers as the first row
+    # if empty, append final_headers
     if not existing:
         worksheet.append_row(final_headers)
 
-    # Build the row in the order of final_headers
     row_values = []
     for col in final_headers:
         val = row_dict.get(col, "")
@@ -311,7 +271,6 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     bill_hash = hashlib.md5(file_bytes).hexdigest()
     existing = get_all_records_safe(worksheet)
-    # Duplicate detection
     if any(r.get("Bill_Hash") == bill_hash for r in existing):
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
