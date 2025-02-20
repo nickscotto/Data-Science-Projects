@@ -44,6 +44,36 @@ CHARGE_TYPE_MAP = {
     "supply": "Supply"
 }
 
+# Define the complete set of expected output keys in the desired order.
+EXPECTED_HEADERS = [
+    "User_ID",
+    "Bill_ID",
+    "Bill_Month_Year",
+    "Bill_Hash",
+    "Customer Charge Amount",
+    "Distribution Charge First kWh Amount",
+    "Distribution Charge First kWh Rate",
+    "Distribution Charge Last kWh Amount",
+    "Distribution Charge Last kWh Rate",
+    "MYP Adjustment First Amount",
+    "MYP Adjustment First Rate",
+    "Environmental Surcharge kWh Amount",
+    "Environmental Surcharge kWh Rate",
+    "EmPOWER Maryland kWh Amount",
+    "EmPOWER Maryland kWh Rate",
+    "Administrative Credit Amount",
+    "Universal Service Program Amount",
+    "MD Franchise Tax kWh Amount",
+    "MD Franchise Tax kWh Rate",
+    "Total Electric Delivery Charges Amount",
+    "Standard Offer Service & Transmission Amount",
+    "Standard Offer Service & Transmission Rate",
+    "Procurement Cost Adjustment Amount",
+    "Procurement Cost Adjustment Rate",
+    "Total Electric Supply Charges Amount",
+    "Total Electric Charges - Residential Service Amount"
+]
+
 # --- Utility Functions ---
 def get_all_records_safe(ws):
     try:
@@ -53,7 +83,7 @@ def get_all_records_safe(ws):
         data = ws.get_all_values()
         if data and len(data) > 1:
             headers = data[0]
-            # Ensure header names are unique by appending an index if duplicates are found.
+            # Make header names unique
             seen = {}
             unique_headers = []
             for h in headers:
@@ -79,12 +109,6 @@ def get_user_id(name):
 
 # --- Parsing Charge Lines ---
 def parse_charge_line(line):
-    """
-    Attempts to parse a charge line using two patterns:
-      Pattern 1: <desc> [X $<rate> per kWh] <amount>
-      Pattern 2: <desc> $<amount>
-    Returns a dict with keys "desc", "rate" (may be empty), and "amount" (float), or None.
-    """
     pattern1 = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
     )
@@ -104,9 +128,6 @@ def parse_charge_line(line):
     return None
 
 def combine_table_lines(table_lines):
-    """
-    Builds each table row by accumulating lines until the candidate row parses correctly.
-    """
     combined = []
     buffer = ""
     for line in table_lines:
@@ -123,9 +144,6 @@ def combine_table_lines(table_lines):
 
 # --- Extracting Charge Tables from PDF ---
 def extract_charge_tables(file_bytes):
-    """
-    Finds every table that starts with the header line and collects the following lines until a new header appears.
-    """
     tables = []
     with pdfplumber.open(file_bytes) as pdf:
         for page in pdf.pages:
@@ -152,10 +170,6 @@ def extract_charge_tables(file_bytes):
     return tables
 
 def extract_charges(file_bytes):
-    """
-    Processes all detected tables and, using both table-based extraction and a fallback full-text search,
-    returns a list (in PDF order) of charge entries with keys "Mapped", "Rate", and "Amount".
-    """
     tables = extract_charge_tables(file_bytes)
     charges = []
     for table in tables:
@@ -170,7 +184,7 @@ def extract_charges(file_bytes):
                         "Rate": parsed["rate"],
                         "Amount": parsed["amount"]
                     })
-    # Fallback: ensure no expected charge is left out by scanning the full text.
+    # Fallback search in full text:
     expected_keys = [
         "Customer Charge", "Distribution Charge First kWh",
         "Distribution Charge Last kWh", "MYP Adjustment First",
@@ -249,23 +263,27 @@ def process_pdf(file_io):
     meta = extract_metadata_from_pdf(file_io)
     user_id = get_user_id(meta["Person"])
 
-    # Use an OrderedDict to preserve the order.
+    # Build an OrderedDict using the complete EXPECTED_HEADERS order.
     output = OrderedDict()
+    for key in EXPECTED_HEADERS:
+        output[key] = ""  # initialize with empty string
+
     output["User_ID"] = user_id
     output["Bill_ID"] = str(uuid.uuid4())
     output["Bill_Month_Year"] = meta["Bill_Month_Year"]
     output["Bill_Hash"] = bill_hash
 
-    # Add charge columns in the order they appear in the PDF.
+    # Insert extracted charge values into the corresponding keys.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
-            amt_col = f"{mapped} Amount"
-            rate_col = f"{mapped} Rate"
-            if amt_col not in output:
-                output[amt_col] = ch["Amount"]
-                if ch["Rate"]:
-                    output[rate_col] = ch["Rate"]
+            amt_key = f"{mapped} Amount"
+            rate_key = f"{mapped} Rate"
+            # If this key is expected, update it.
+            if amt_key in output:
+                output[amt_key] = ch["Amount"]
+            if ch["Rate"] and rate_key in output:
+                output[rate_key] = ch["Rate"]
     return output
 
 def append_row_to_sheet(row_dict):
@@ -273,11 +291,9 @@ def append_row_to_sheet(row_dict):
     if existing:
         headers = list(existing[0].keys())
     else:
-        headers = list(row_dict.keys())
+        headers = list(EXPECTED_HEADERS)
         worksheet.append_row(headers)
-    for key in row_dict.keys():
-        if key not in headers:
-            headers.append(key)
+    # Ensure our row follows the existing header order.
     row_values = [str(row_dict.get(h, "")) for h in headers]
     worksheet.append_row(row_values)
 
