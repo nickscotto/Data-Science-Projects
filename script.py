@@ -13,9 +13,7 @@ scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_info(
-    st.secrets["gcp_service_account"], scopes=scope
-)
+creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 try:
@@ -26,18 +24,18 @@ except Exception as e:
 worksheet = spreadsheet.sheet1
 
 # --- Mapping for Charge Types ---
+# Adjust these partial strings to match the text in your PDFs.
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
-    "distribution charge first": "Distribution Charge First kWh",
-    "distribution charge last": "Distribution Charge Last kWh",
-    "environmental surcharge": "Environmental Surcharge kWh",
-    "empower maryland": "EmPOWER Maryland kWh",
+    "distribution charge": "Distribution Charge",
+    "environmental surcharge": "Environmental Surcharge",
+    "empower maryland": "EmPOWER Maryland",
+    "administrative credit": "Administrative Credit",
     "universal service program": "Universal Service Program",
-    "md franchise tax": "MD Franchise Tax kWh",
+    "md franchise tax": "MD Franchise Tax",
     "total electric delivery charges": "Total Electric Delivery Charges",
-    "transmission first": "Transmission First kWh",
-    "transmission last": "Transmission Last kWh",
-    "adjustment": "Adjustment kWh",
+    "standard offer service": "Standard Offer Service & Transmission",
+    "procurement cost adjustment": "Procurement Cost Adjustment",
     "total electric supply charges": "Total Electric Supply Charges",
     "total electric charges - residential service": "Total Electric Charges - Residential Service",
     "delivery": "Delivery",
@@ -57,6 +55,7 @@ def get_all_records_safe(ws):
         return []
 
 def map_charge_description(desc):
+    """Return a standardized charge name if any key in CHARGE_TYPE_MAP appears in desc."""
     desc_lower = desc.lower()
     for partial, standard in CHARGE_TYPE_MAP.items():
         if partial in desc_lower:
@@ -64,15 +63,17 @@ def map_charge_description(desc):
     return None
 
 def get_user_id(name):
-    name = name.strip() or "Unknown"
-    return hashlib.sha256(name.encode("utf-8")).hexdigest()
+    """Normalize the name and return a deterministic User_ID via SHA-256."""
+    normalized = name.strip().upper() or "UNKNOWN"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-# --- Extract Charge Tables Using Header Anchor ---
+# --- Charge Table Extraction Using Header Anchor ---
 def extract_charge_tables(file_bytes):
     """
-    Scans every page for the header "Type of charge  How we calculate this charge  Amount($)".
-    When found, collects subsequent non-empty lines as part of that table.
-    Returns a list of tables (each a list of lines).
+    Scan every page for the header line:
+      "Type of charge  How we calculate this charge  Amount($)"
+    For each occurrence, collect subsequent lines (until the next header or blank line)
+    and return a list of tables (each table is a list of lines).
     """
     tables = []
     with pdfplumber.open(file_bytes) as pdf:
@@ -81,20 +82,18 @@ def extract_charge_tables(file_bytes):
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             i = 0
             while i < len(lines):
-                # Look for header anchor (case-insensitive)
-                if ("type of charge" in lines[i].lower() and
-                    "how we calculate" in lines[i].lower() and
+                # Check if this line contains the header keywords.
+                if ("type of charge" in lines[i].lower() and 
+                    "how we calculate" in lines[i].lower() and 
                     "amount($" in lines[i].lower()):
                     table_lines = []
                     i += 1
-                    # Collect lines until a blank or a line that looks not part of the table.
-                    while i < len(lines):
-                        curr = lines[i]
-                        # Stop if we hit a line that's clearly not part of the table.
-                        # Here we stop if the line is very short.
-                        if len(curr) < 3:
+                    # Collect subsequent lines until a blank or a new header is reached.
+                    while i < len(lines) and not ("type of charge" in lines[i].lower() and "amount($" in lines[i].lower()):
+                        # We require that the line has some numeric data or "kWh" to consider it part of the table.
+                        if len(lines[i]) < 3 or (not re.search(r"\d", lines[i]) and "kwh" not in lines[i].lower()):
                             break
-                        table_lines.append(curr)
+                        table_lines.append(lines[i])
                         i += 1
                     if table_lines:
                         tables.append(table_lines)
@@ -104,12 +103,14 @@ def extract_charge_tables(file_bytes):
 
 def parse_charge_line(line):
     """
-    Attempts to parse a line from a charge table.
-    Pattern: <description> [X $<rate> per kWh] <amount>
-    If the rate part is missing, it uses a simpler pattern: <description> $<amount>
-    Returns a dict with keys "desc", "rate", and "amount" (as float), or None.
+    Parse a charge line using two patterns:
+      Pattern 1: <desc> [X $<rate> per kWh] <amount>
+      Pattern 2: <desc> $<amount>
+    Returns a dict with keys "desc", "rate" (may be empty), and "amount" as float, or None.
     """
-    pattern1 = (r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$")
+    pattern1 = (
+        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
+    )
     pattern2 = r"^(?P<desc>.+?)\s+\$(?P<amount>[\d,\.]+)$"
     m = re.match(pattern1, line)
     if not m:
@@ -127,10 +128,9 @@ def parse_charge_line(line):
 
 def extract_charges(file_bytes):
     """
-    Uses extract_charge_tables to obtain all tables,
-    then parses each line with parse_charge_line.
-    Only includes charges where the description maps to a known type.
-    Returns a list of charges with standardized "Mapped", "Rate", and "Amount".
+    Extract charges from all tables detected in the PDF.
+    Returns a list of dictionaries with standardized keys:
+      "Mapped" (standardized charge type), "Rate", and "Amount".
     """
     tables = extract_charge_tables(file_bytes)
     charges = []
@@ -138,7 +138,7 @@ def extract_charges(file_bytes):
         for line in table:
             parsed = parse_charge_line(line)
             if parsed:
-                # Clean the description: remove digits before 'kWh'
+                # Clean description: remove extra digits from "kWh"
                 cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", parsed["desc"], flags=re.IGNORECASE).strip()
                 mapped = map_charge_description(cleaned_desc)
                 if mapped:
@@ -152,9 +152,9 @@ def extract_charges(file_bytes):
 # --- Metadata Extraction ---
 def extract_metadata_from_pdf(file_bytes):
     """
-    Extracts Bill_Month_Year and a candidate Person from page 1.
-    Searches all non-empty lines using multiple date patterns.
-    Returns a dict with keys "Bill_Month_Year" and "Person".
+    Extracts Bill_Month_Year and Person from page 1.
+    Scans all non-empty lines using multiple date patterns.
+    Returns a dict with "Bill_Month_Year" (in MM-YYYY) and "Person".
     """
     meta = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
@@ -186,7 +186,7 @@ def extract_metadata_from_pdf(file_bytes):
         if date_found:
             break
 
-    # Look for a candidate name among lines following the date header.
+    # For the person's name, look at lines after the date.
     candidate = ""
     if date_idx is not None:
         for ln in lines[date_idx+1:]:
