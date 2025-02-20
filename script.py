@@ -8,6 +8,10 @@ from collections import OrderedDict
 import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Google Sheets Setup ---
 scope = [
@@ -37,7 +41,8 @@ CHARGE_TYPE_MAP = {
     "standard offer service & transmission": "Standard Offer Service & Transmission",
     "procurement cost adjustment": "Procurement Cost Adjustment",
     "total electric supply charges": "Total Electric Supply Charges",
-    "total electric charges - residential service": "Total Electric Charges - Residential Service"
+    "total electric charges - residential service": "Total Electric Charges - Residential Service",
+    "myp adjustment": "MYP Adjustment"
 }
 
 # Define the complete set of expected output keys in the desired order
@@ -49,6 +54,8 @@ EXPECTED_HEADERS = [
     "Customer Charge Amount",
     "Distribution Charge Amount",
     "Distribution Charge Rate",
+    "MYP Adjustment Amount",
+    "MYP Adjustment Rate",
     "Environmental Surcharge Amount",
     "Environmental Surcharge Rate",
     "EmPOWER Maryland Charge Amount",
@@ -92,6 +99,7 @@ def map_charge_description(desc):
     for partial, standard in CHARGE_TYPE_MAP.items():
         if partial in desc_lower:
             return standard
+    logging.warning(f"Unmapped charge description: {desc}")
     return None
 
 def get_user_id(name):
@@ -175,7 +183,15 @@ def extract_charges(file_bytes):
                     "Amount": parsed["amount"]
                 })
     
+    verify_charges(charges)
     return charges
+
+def verify_charges(charges):
+    expected_charges = set(CHARGE_TYPE_MAP.values())
+    extracted_charges = set(ch["Mapped"] for ch in charges)
+    missing_charges = expected_charges - extracted_charges
+    if missing_charges:
+        logging.warning(f"Missing charges: {missing_charges}")
 
 # --- Metadata Extraction ---
 def extract_metadata_from_pdf(file_bytes):
