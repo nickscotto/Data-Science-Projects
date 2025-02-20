@@ -93,28 +93,29 @@ def parse_charge_line(line):
 
 def combine_table_lines(table_lines):
     """
-    Combines lines that do not independently match the charge pattern
-    with the previous line.
-    Returns a new list of combined lines.
+    Builds each table row by accumulating lines until the candidate row parses successfully.
     """
     combined = []
+    buffer = ""
     for line in table_lines:
-        if parse_charge_line(line):
-            combined.append(line)
+        if buffer:
+            candidate = buffer + " " + line
         else:
-            if combined:
-                combined[-1] = combined[-1] + " " + line
-            else:
-                combined.append(line)
+            candidate = line
+        parsed = parse_charge_line(candidate)
+        if parsed:
+            combined.append(candidate)
+            buffer = ""
+        else:
+            buffer = candidate
+    if buffer:
+        combined.append(buffer)
     return combined
 
 # --- Extracting Charge Tables from PDF ---
 def extract_charge_tables(file_bytes):
     """
-    Scans every page for the header:
-      "Type of charge  How we calculate this charge  Amount($)"
-    For each occurrence, collects the subsequent lines until a new header is detected.
-    Returns a list of tables (each table is a list of lines).
+    Finds every table that starts with the header line and collects the following lines until a new header appears.
     """
     tables = []
     with pdfplumber.open(file_bytes) as pdf:
@@ -130,6 +131,7 @@ def extract_charge_tables(file_bytes):
                     i += 1
                     while i < len(lines):
                         curr = lines[i]
+                        # If we hit another header, we assume this table ended.
                         if ("type of charge" in curr.lower() and "amount($" in curr.lower()):
                             break
                         table_lines.append(curr)
@@ -143,9 +145,8 @@ def extract_charge_tables(file_bytes):
 
 def extract_charges(file_bytes):
     """
-    Extracts charges from all detected tables.
-    Returns a list of charges with keys:
-      "Mapped", "Rate", and "Amount".
+    Processes all detected tables and, using both table-based extraction and a fallback full-text search,
+    returns a list of charge entries with keys "Mapped", "Rate", and "Amount".
     """
     tables = extract_charge_tables(file_bytes)
     charges = []
@@ -161,31 +162,34 @@ def extract_charges(file_bytes):
                         "Rate": parsed["rate"],
                         "Amount": parsed["amount"]
                     })
-    # --- Fallback search for missing Total Electric Charges - Residential Service ---
-    if not any(ch.get("Mapped") == "Total Electric Charges - Residential Service" for ch in charges):
-        with pdfplumber.open(file_bytes) as pdf:
-            for page in pdf.pages:
-                for line in page.extract_text().splitlines():
-                    if "total electric charges - residential service" in line.lower():
-                        parsed = parse_charge_line(line.strip())
-                        if parsed:
-                            cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", parsed["desc"], flags=re.IGNORECASE).strip()
-                            mapped = map_charge_description(cleaned_desc)
-                            if mapped == "Total Electric Charges - Residential Service":
-                                charges.append({
-                                    "Mapped": mapped,
-                                    "Rate": parsed["rate"],
-                                    "Amount": parsed["amount"]
-                                })
-                                break  # Found it on this page; no need to continue
+    # Fallback: ensure no expected charge is left out by scanning the full text.
+    expected_keys = [
+        "Customer Charge", "Distribution Charge First kWh",
+        "Distribution Charge Last kWh", "MYP Adjustment First",
+        "Environmental Surcharge kWh", "EmPOWER Maryland kWh",
+        "Administrative Credit", "Universal Service Program",
+        "MD Franchise Tax kWh", "Total Electric Delivery Charges",
+        "Standard Offer Service & Transmission", "Procurement Cost Adjustment",
+        "Total Electric Supply Charges", "Total Electric Charges - Residential Service"
+    ]
+    with pdfplumber.open(file_bytes) as pdf:
+        full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+    for key in expected_keys:
+        if not any(ch["Mapped"] == key for ch in charges):
+            # Look for a line containing the key and an amount.
+            pattern = re.compile(rf"(?P<desc>{re.escape(key)}.*?)\s+\$(?P<amount>-?[\d,]+(?:\.\d+)?)", re.IGNORECASE)
+            match = pattern.search(full_text)
+            if match:
+                amt = float(match.group("amount").replace(",", ""))
+                charges.append({
+                    "Mapped": key,
+                    "Rate": "",
+                    "Amount": amt
+                })
     return charges
 
 # --- Metadata Extraction ---
 def extract_metadata_from_pdf(file_bytes):
-    """
-    Extracts Bill_Month_Year and Person from page 1.
-    Searches for any date using multiple patterns and then looks for a candidate name after the date.
-    """
     meta = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
@@ -253,14 +257,13 @@ def process_pdf(file_io):
         "Bill_Month_Year": meta["Bill_Month_Year"],
         "Bill_Hash": bill_hash
     }
-    # When adding charges, update if the new value is nonzero.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
             amt_col = f"{mapped} Amount"
             rate_col = f"{mapped} Rate"
+            # If a key already exists, update only if the new amount isn’t zero.
             if amt_col in output:
-                # Only update if the new amount is not zero.
                 if ch["Amount"] != 0.0:
                     output[amt_col] = ch["Amount"]
                     if ch["Rate"]:
