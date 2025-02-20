@@ -1,52 +1,47 @@
 import streamlit as st
-import io
-import re
-import uuid
-import hashlib
-from datetime import datetime
-from collections import OrderedDict
 import pdfplumber
+import re
+from collections import OrderedDict
+import hashlib
+import uuid
 import gspread
 from google.oauth2.service_account import Credentials
 import logging
 from io import StringIO
 
-# --- Custom Logging Handler ---
-class StreamToLogger:
+# --- Logging Setup ---
+class StreamLogger:
     def __init__(self):
         self.stream = StringIO()
-    
     def write(self, buf):
         self.stream.write(buf)
-    
     def flush(self):
         pass
 
-# Configure logging with custom handler
-log_stream = StreamToLogger()
+log_stream = StreamLogger()
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(message)s',
+    handlers=[logging.StreamHandler(log_stream)]
+)
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-handler = logging.StreamHandler(log_stream.stream)
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(handler)
 
 # --- Google Sheets Setup ---
-scope = [
+SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
-gc = gspread.authorize(creds)
 SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 try:
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPE)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 except Exception as e:
-    st.error("Error opening spreadsheet: " + str(e))
+    st.error(f"Failed to connect to Google Sheets: {e}")
     st.stop()
-worksheet = spreadsheet.sheet1
 
-# --- Mapping for Charge Types ---
-CHARGE_TYPE_MAP = {
+# --- Charge Mapping and Headers ---
+CHARGE_MAP = {
     "customer charge": "Customer Charge",
     "distribution charge": "Distribution Charge",
     "environmental surcharge": "Environmental Surcharge",
@@ -58,274 +53,176 @@ CHARGE_TYPE_MAP = {
     "standard offer service & transmission": "Standard Offer Service & Transmission",
     "procurement cost adjustment": "Procurement Cost Adjustment",
     "total electric supply charges": "Total Electric Supply Charges",
-    "total electric charges - residential service": "Total Electric Charges - Residential Service",
-    "myp adjustment": "MYP Adjustment"
+    "total electric charges - residential service": "Total Electric Charges - Residential Service"
 }
 
-# Define the complete set of expected output keys in the desired order
-EXPECTED_HEADERS = [
-    "User_ID",
-    "Bill_ID",
-    "Bill_Month_Year",
-    "Bill_Hash",
-    "Customer Charge Amount",
-    "Distribution Charge Amount",
-    "Distribution Charge Rate",
-    "MYP Adjustment Amount",
-    "MYP Adjustment Rate",
-    "Environmental Surcharge Amount",
-    "Environmental Surcharge Rate",
-    "EmPOWER Maryland Charge Amount",
-    "EmPOWER Maryland Charge Rate",
-    "Administrative Credit Amount",
-    "Universal Service Program Amount",
-    "MD Franchise Tax Amount",
-    "MD Franchise Tax Rate",
+HEADERS = [
+    "User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash",
+    "Customer Charge Amount", "Distribution Charge Amount", "Distribution Charge Rate",
+    "Environmental Surcharge Amount", "Environmental Surcharge Rate",
+    "EmPOWER Maryland Charge Amount", "EmPOWER Maryland Charge Rate",
+    "Administrative Credit Amount", "Universal Service Program Amount",
+    "MD Franchise Tax Amount", "MD Franchise Tax Rate",
     "Total Electric Delivery Charges Amount",
-    "Standard Offer Service & Transmission Amount",
-    "Standard Offer Service & Transmission Rate",
-    "Procurement Cost Adjustment Amount",
-    "Procurement Cost Adjustment Rate",
-    "Total Electric Supply Charges Amount",
-    "Total Electric Charges - Residential Service Amount"
+    "Standard Offer Service & Transmission Amount", "Standard Offer Service & Transmission Rate",
+    "Procurement Cost Adjustment Amount", "Procurement Cost Adjustment Rate",
+    "Total Electric Supply Charges Amount", "Total Electric Charges - Residential Service Amount"
 ]
 
-# --- Utility Functions ---
-def get_all_records_safe(ws):
-    try:
-        return ws.get_all_records()
-    except Exception as e:
-        st.error("Error fetching records: " + str(e))
-        data = ws.get_all_values()
-        if data and len(data) > 1:
-            headers = data[0]
-            seen = {}
-            unique_headers = []
-            for h in headers:
-                if h in seen:
-                    seen[h] += 1
-                    unique_headers.append(f"{h}_{seen[h]}")
-                else:
-                    seen[h] = 0
-                    unique_headers.append(h)
-            return [dict(zip(unique_headers, row)) for row in data[1:]]
-        return []
-
-def map_charge_description(desc):
-    desc_lower = desc.lower()
-    for partial, standard in CHARGE_TYPE_MAP.items():
-        if partial in desc_lower:
-            return standard
-    logger.warning(f"Unmapped charge description: {desc}")
-    return None
-
+# --- Helper Functions ---
 def get_user_id(name):
-    normalized = name.strip().upper() or "UNKNOWN"
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return hashlib.sha256((name.strip().upper() or "UNKNOWN").encode("utf-8")).hexdigest()
 
-# --- Parsing and Extraction Functions ---
 def parse_charge_line(line):
+    # Patterns for charge lines
     patterns = [
-        r"^(?P<desc>.+?)(?:\s+\d+\s*kWh\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+(?P<amount>-?[\d,\.]+)$",
-        r"^(?P<desc>.+?)\s+\$(?P<amount>-?[\d,\.]+)$",
-        r"^(?P<desc>.+?)(?:\s+\d+\s*kWh\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?\s+-?(?P<amount>[\d,\.]+)$"
+        r"^(.*?)(?:\s+\d+\s*kWh\s+X\s+\$(.*?)(?:-)?\s+per\s+kWh)?\s+(-?[\d\.]+)$",
+        r"^(.*?)\s+\$?(-?[\d\.]+)$"
     ]
-    
     for pattern in patterns:
-        m = re.match(pattern, line)
-        if m:
-            raw_desc = m.group("desc").strip()
-            rate_val = m.group("rate") if "rate" in m.groupdict() and m.group("rate") else ""
-            amt_str = m.group("amount").replace(",", "").replace("−", "-")
+        match = re.match(pattern, line.strip())
+        if match:
+            desc, rate, amount = match.groups()
+            desc = desc.strip()
+            rate = rate or ""
             try:
-                amt_val = float(amt_str)
-                return {"desc": raw_desc, "rate": rate_val, "amount": amt_val}
+                amount = float(amount.replace("−", "-"))
+                return {"desc": desc, "rate": rate, "amount": amount}
             except ValueError:
                 continue
-    logger.debug(f"Failed to parse line: {line}")
+    logger.debug(f"Could not parse line: {line}")
     return None
 
-def extract_charge_tables(file_bytes):
+def extract_tables_from_pdf(file_bytes):
     tables = []
-    with pdfplumber.open(file_bytes) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            i = 0
-            while i < len(lines):
-                if ("type of charge" in lines[i].lower() and 
-                    "how we calculate" in lines[i].lower() and 
-                    "amount($" in lines[i].lower()):
-                    table_lines = []
-                    i += 1
-                    while i < len(lines):
-                        curr = lines[i]
-                        if ("type of charge" in curr.lower() and 
-                            "how we calculate" in curr.lower() and 
-                            "amount($" in curr.lower()):
-                            break
-                        if curr.strip():
-                            table_lines.append(curr)
+    try:
+        with pdfplumber.open(file_bytes) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                lines = text.splitlines()
+                i = 0
+                while i < len(lines):
+                    if "type of charge how we calculate this charge amount($" in lines[i].lower():
+                        table = []
                         i += 1
-                    
-                    if table_lines:
-                        combined = []
-                        buffer = ""
-                        for line in table_lines:
-                            candidate = (buffer + " " + line).strip() if buffer else line
-                            parsed = parse_charge_line(candidate)
-                            if parsed:
-                                combined.append(parsed)
-                                buffer = ""
-                            else:
-                                buffer = candidate
-                        if combined:
-                            tables.append(combined)
-                else:
-                    i += 1
+                        while i < len(lines) and not "type of charge" in lines[i].lower():
+                            line = lines[i].strip()
+                            if line:
+                                parsed = parse_charge_line(line)
+                                if parsed:
+                                    table.append(parsed)
+                                else:
+                                    # Combine with previous line if parsing fails (multi-line entry)
+                                    if table and "desc" in table[-1]:
+                                        table[-1]["desc"] += " " + line
+                                        new_parse = parse_charge_line(table[-1]["desc"])
+                                        if new_parse:
+                                            table[-1] = new_parse
+                            i += 1
+                        if table:
+                            tables.append(table)
+                    else:
+                        i += 1
+        logger.info(f"Extracted {len(tables)} tables")
+    except Exception as e:
+        logger.error(f"PDF extraction failed: {e}")
     return tables
 
-def extract_charges(file_bytes):
-    tables = extract_charge_tables(file_bytes)
-    charges_dict = {}
-    
+def process_charges(tables):
+    charges = OrderedDict.fromkeys([h for h in HEADERS if h.endswith("Amount") or h.endswith("Rate")], "")
     for table in tables:
-        for parsed in table:
-            cleaned_desc = re.sub(r"\d+\s*kWh", "", parsed["desc"], flags=re.IGNORECASE).strip()
-            mapped = map_charge_description(cleaned_desc)
+        for entry in table:
+            desc = entry["desc"].lower()
+            mapped = next((v for k, v in CHARGE_MAP.items() if k in desc), None)
             if mapped:
-                if mapped in charges_dict:
-                    charges_dict[mapped]["Amount"] += parsed["amount"]
-                else:
-                    charges_dict[mapped] = {
-                        "Mapped": mapped,
-                        "Rate": parsed["rate"],
-                        "Amount": parsed["amount"]
-                    }
-    
-    charges = list(charges_dict.values())
-    verify_charges(charges)
+                amt_key = f"{mapped} Amount"
+                rate_key = f"{mapped} Rate"
+                if amt_key in charges:
+                    charges[amt_key] = charges[amt_key] or 0
+                    charges[amt_key] += entry["amount"]
+                if rate_key in charges and entry["rate"]:
+                    charges[rate_key] = entry["rate"]
     return charges
 
-def verify_charges(charges):
-    expected_charges = set(CHARGE_TYPE_MAP.values())
-    extracted_charges = set(ch["Mapped"] for ch in charges)
-    missing_charges = expected_charges - extracted_charges
-    if missing_charges:
-        logger.warning(f"Missing charges: {missing_charges}")
-
-# --- Metadata Extraction ---
-def extract_metadata_from_pdf(file_bytes):
+def extract_metadata(file_bytes):
     meta = {"Bill_Month_Year": "", "Person": ""}
-    with pdfplumber.open(file_bytes) as pdf:
-        text = pdf.pages[0].extract_text() or ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    
-    patterns = [
-        (r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}", "%B %Y"),
-        (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}", "%b %Y"),
-        (r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}", "%B %d, %Y"),
-        (r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}", "%b %d, %Y")
-    ]
-    
-    date_found = False
-    date_idx = None
-    for i, line in enumerate(lines):
-        for pat, fmt in patterns:
-            match = re.search(pat, line, re.IGNORECASE)
-            if match:
-                date_str = match.group(0)
-                try:
-                    parsed = datetime.strptime(date_str, fmt)
-                    meta["Bill_Month_Year"] = parsed.strftime("%m-%Y")
-                except Exception:
-                    meta["Bill_Month_Year"] = date_str
-                date_found = True
-                date_idx = i
-                break
-        if date_found:
-            break
-
-    candidate = ""
-    if date_idx is not None:
-        for ln in lines[date_idx+1:]:
-            if any(word in ln.lower() for word in ["account", "bill", "period", "address", "issue", "summary", "total"]):
-                continue
-            if " " in ln:
-                letters = [ch for ch in ln if ch.isalpha()]
-                if letters and (sum(1 for ch in letters if ch.isupper()) / len(letters)) >= 0.8:
-                    candidate = ln
-                    break
-    if not candidate:
-        candidate = "Unknown"
-    meta["Person"] = candidate
+    try:
+        with pdfplumber.open(file_bytes) as pdf:
+            text = pdf.pages[0].extract_text() or ""
+            lines = text.splitlines()
+            for line in lines:
+                if "your electric bill -" in line.lower():
+                    month_year = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{4}", line, re.I)
+                    if month_year:
+                        meta["Bill_Month_Year"] = datetime.strptime(month_year.group(), "%b %Y").strftime("%m-%Y")
+                elif "account number:" in line.lower():
+                    next_line = lines[lines.index(line) + 1]
+                    if not any(x in next_line.lower() for x in ["account", "bill", "period"]):
+                        meta["Person"] = next_line.strip()
+    except Exception as e:
+        logger.error(f"Metadata extraction failed: {e}")
     return meta
 
-# --- Main PDF Processing ---
-def process_pdf(file_io):
-    bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    charges = extract_charges(file_io)
-    meta = extract_metadata_from_pdf(file_io)
-    user_id = get_user_id(meta["Person"])
-
-    output = OrderedDict()
-    for key in EXPECTED_HEADERS:
-        output[key] = ""
-
-    output["User_ID"] = user_id
+def process_pdf(file_bytes):
+    logger.info("Processing PDF")
+    bill_hash = hashlib.md5(file_bytes).hexdigest()
+    tables = extract_tables_from_pdf(file_bytes)
+    charges = process_charges(tables)
+    meta = extract_metadata(file_bytes)
+    
+    output = OrderedDict.fromkeys(HEADERS, "")
+    output["User_ID"] = get_user_id(meta["Person"])
     output["Bill_ID"] = str(uuid.uuid4())
-    output["Bill_Month_Year"] = meta["Bill_Month_Year"]
+    output["Bill_Month_Year"] = meta["Bill_Month_Year"] or "Unknown"
     output["Bill_Hash"] = bill_hash
-
-    for ch in charges:
-        mapped = ch.get("Mapped")
-        if mapped:
-            amt_key = f"{mapped} Amount"
-            rate_key = f"{mapped} Rate"
-            if amt_key in output and not output[amt_key]:
-                output[amt_key] = ch["Amount"]
-            if ch["Rate"] and rate_key in output and not output[rate_key]:
-                output[rate_key] = ch["Rate"]
+    output.update(charges)
+    
+    logger.info("PDF processing complete")
     return output
 
-def append_row_to_sheet(row_dict):
-    existing = get_all_records_safe(worksheet)
-    if existing:
-        headers = list(existing[0].keys())
-    else:
-        headers = list(EXPECTED_HEADERS)
-        worksheet.append_row(headers)
-    row_values = [str(row_dict.get(h, "")) for h in headers]
-    worksheet.append_row(row_values)
+def append_to_sheet(data):
+    try:
+        existing = sheet.get_all_records()
+        headers = HEADERS if not existing else list(existing[0].keys())
+        if not existing:
+            sheet.append_row(headers)
+        row = [str(data.get(h, "")) for h in headers]
+        sheet.append_row(row)
+        logger.info("Data appended to sheet")
+    except Exception as e:
+        logger.error(f"Sheet append failed: {e}")
+        raise
 
 # --- Streamlit UI ---
 st.title("Delmarva BillWatch")
-st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
+st.write("Upload your Delmarva Power PDF bill to store charge data in Google Sheets.")
 
 st.markdown("""
 **Privacy Disclaimer:**  
-By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power.  
-Your information will not be shared publicly or sold.  
-This form is for informational and organizational purposes only and does not constitute legal representation.
+By submitting your bill, you agree that your deidentified data may be used to investigate billing issues with Delmarva Power.  
+Your information will not be shared publicly or sold. This is for informational purposes only and does not constitute legal representation.
 """)
 
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
-if uploaded_file is not None:
-    file_bytes = uploaded_file.read()
-    bill_hash = hashlib.md5(file_bytes).hexdigest()
-    existing = get_all_records_safe(worksheet)
-    if any(r.get("Bill_Hash") == bill_hash for r in existing):
-        st.warning("This bill has already been uploaded. Duplicate not added.")
-    else:
-        with st.spinner("Processing PDF..."):
-            # Reset log stream before processing
+if uploaded_file:
+    with st.spinner("Processing your bill..."):
+        file_bytes = uploaded_file.read()
+        bill_hash = hashlib.md5(file_bytes).hexdigest()
+        
+        existing = sheet.get_all_records()
+        if any(r.get("Bill_Hash") == bill_hash for r in existing):
+            st.warning("This bill has already been uploaded.")
+        else:
             log_stream.stream.truncate(0)
             log_stream.stream.seek(0)
-            output_row = process_pdf(io.BytesIO(file_bytes))
-            append_row_to_sheet(output_row)
-            st.success("Thank you for your contribution!")
-            # Display any warnings
-            log_output = log_stream.stream.getvalue()
-            if "WARNING" in log_output:
-                st.warning("Processing warnings:\n" + log_output)
+            try:
+                result = process_pdf(file_bytes)
+                append_to_sheet(result)
+                st.success("Upload successful! Thank you for your contribution.")
+                log_output = log_stream.stream.getvalue()
+                if "WARNING" in log_output or "ERROR" in log_output:
+                    st.warning(f"Processing details:\n{log_output}")
+            except Exception as e:
+                st.error(f"Processing failed: {e}")
+                st.warning(f"Logs:\n{log_stream.stream.getvalue()}")
