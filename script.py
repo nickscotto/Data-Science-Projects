@@ -24,7 +24,6 @@ except Exception as e:
 worksheet = spreadsheet.sheet1
 
 # --- Mapping for Charge Types ---
-# Adjust these keys as needed to capture your exact charge descriptions.
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
     "distribution charge first": "Distribution Charge First kWh",
@@ -100,11 +99,11 @@ def combine_table_lines(table_lines):
     """
     combined = []
     for line in table_lines:
-        parsed = parse_charge_line(line)
-        if parsed:
+        # If current line parses, add it as a new row.
+        if parse_charge_line(line):
             combined.append(line)
         else:
-            # If it doesn't parse, assume it's a continuation of the previous line.
+            # Otherwise, assume it's a continuation of the previous line.
             if combined:
                 combined[-1] = combined[-1] + " " + line
             else:
@@ -116,7 +115,7 @@ def extract_charge_tables(file_bytes):
     """
     Scans every page for the header:
       "Type of charge  How we calculate this charge  Amount($)"
-    For each occurrence, collects the subsequent lines (until a new header or blank line).
+    For each occurrence, collects the subsequent lines until a new header is detected.
     Returns a list of tables (each table is a list of lines).
     """
     tables = []
@@ -133,15 +132,12 @@ def extract_charge_tables(file_bytes):
                     i += 1
                     while i < len(lines):
                         curr = lines[i]
-                        if len(curr) < 3:
-                            break
-                        # If we hit another header, stop.
+                        # Stop if a new header is encountered.
                         if ("type of charge" in curr.lower() and "amount($" in curr.lower()):
                             break
                         table_lines.append(curr)
                         i += 1
                     if table_lines:
-                        # Combine multi-line rows.
                         combined = combine_table_lines(table_lines)
                         tables.append(combined)
                 else:
