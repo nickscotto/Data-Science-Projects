@@ -25,7 +25,6 @@ except Exception as e:
 worksheet = spreadsheet.sheet1
 
 # --- Mapping for Charge Types ---
-# Added mapping for "myp adjustment" so that it is captured and placed in PDF order.
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
     "distribution charge first": "Distribution Charge First kWh",
@@ -54,7 +53,17 @@ def get_all_records_safe(ws):
         data = ws.get_all_values()
         if data and len(data) > 1:
             headers = data[0]
-            return [dict(zip(headers, row)) for row in data[1:]]
+            # Ensure header names are unique by appending an index if duplicates are found.
+            seen = {}
+            unique_headers = []
+            for h in headers:
+                if h in seen:
+                    seen[h] += 1
+                    unique_headers.append(f"{h}_{seen[h]}")
+                else:
+                    seen[h] = 0
+                    unique_headers.append(h)
+            return [dict(zip(unique_headers, row)) for row in data[1:]]
         return []
 
 def map_charge_description(desc):
@@ -253,7 +262,6 @@ def process_pdf(file_io):
         if mapped:
             amt_col = f"{mapped} Amount"
             rate_col = f"{mapped} Rate"
-            # Only add if not already present
             if amt_col not in output:
                 output[amt_col] = ch["Amount"]
                 if ch["Rate"]:
@@ -267,7 +275,6 @@ def append_row_to_sheet(row_dict):
     else:
         headers = list(row_dict.keys())
         worksheet.append_row(headers)
-    # Add any new keys in order.
     for key in row_dict.keys():
         if key not in headers:
             headers.append(key)
