@@ -9,13 +9,32 @@ import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
 import logging
+from io import StringIO
 
-# Configure logging to output to Streamlit
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Custom Logging Handler ---
+class StreamToLogger:
+    def __init__(self):
+        self.stream = StringIO()
+    
+    def write(self, buf):
+        self.stream.write(buf)
+    
+    def flush(self):
+        pass
+
+# Configure logging with custom handler
+log_stream = StreamToLogger()
 logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(log_stream.stream)
+handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
 
 # --- Google Sheets Setup ---
-scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
@@ -43,16 +62,32 @@ CHARGE_TYPE_MAP = {
     "myp adjustment": "MYP Adjustment"
 }
 
+# Define the complete set of expected output keys in the desired order
 EXPECTED_HEADERS = [
-    "User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash",
-    "Customer Charge Amount", "Distribution Charge Amount", "Distribution Charge Rate",
-    "MYP Adjustment Amount", "MYP Adjustment Rate", "Environmental Surcharge Amount",
-    "Environmental Surcharge Rate", "EmPOWER Maryland Charge Amount", "EmPOWER Maryland Charge Rate",
-    "Administrative Credit Amount", "Universal Service Program Amount", "MD Franchise Tax Amount",
-    "MD Franchise Tax Rate", "Total Electric Delivery Charges Amount",
-    "Standard Offer Service & Transmission Amount", "Standard Offer Service & Transmission Rate",
-    "Procurement Cost Adjustment Amount", "Procurement Cost Adjustment Rate",
-    "Total Electric Supply Charges Amount", "Total Electric Charges - Residential Service Amount"
+    "User_ID",
+    "Bill_ID",
+    "Bill_Month_Year",
+    "Bill_Hash",
+    "Customer Charge Amount",
+    "Distribution Charge Amount",
+    "Distribution Charge Rate",
+    "MYP Adjustment Amount",
+    "MYP Adjustment Rate",
+    "Environmental Surcharge Amount",
+    "Environmental Surcharge Rate",
+    "EmPOWER Maryland Charge Amount",
+    "EmPOWER Maryland Charge Rate",
+    "Administrative Credit Amount",
+    "Universal Service Program Amount",
+    "MD Franchise Tax Amount",
+    "MD Franchise Tax Rate",
+    "Total Electric Delivery Charges Amount",
+    "Standard Offer Service & Transmission Amount",
+    "Standard Offer Service & Transmission Rate",
+    "Procurement Cost Adjustment Amount",
+    "Procurement Cost Adjustment Rate",
+    "Total Electric Supply Charges Amount",
+    "Total Electric Charges - Residential Service Amount"
 ]
 
 # --- Utility Functions ---
@@ -61,6 +96,19 @@ def get_all_records_safe(ws):
         return ws.get_all_records()
     except Exception as e:
         st.error("Error fetching records: " + str(e))
+        data = ws.get_all_values()
+        if data and len(data) > 1:
+            headers = data[0]
+            seen = {}
+            unique_headers = []
+            for h in headers:
+                if h in seen:
+                    seen[h] += 1
+                    unique_headers.append(f"{h}_{seen[h]}")
+                else:
+                    seen[h] = 0
+                    unique_headers.append(h)
+            return [dict(zip(unique_headers, row)) for row in data[1:]]
         return []
 
 def map_charge_description(desc):
@@ -271,13 +319,13 @@ if uploaded_file is not None:
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
         with st.spinner("Processing PDF..."):
-            # Clear previous logs for this upload
-            logger.handlers[0].stream.seek(0)
-            logger.handlers[0].stream.truncate(0)
+            # Reset log stream before processing
+            log_stream.stream.truncate(0)
+            log_stream.stream.seek(0)
             output_row = process_pdf(io.BytesIO(file_bytes))
             append_row_to_sheet(output_row)
             st.success("Thank you for your contribution!")
             # Display any warnings
-            log_output = logger.handlers[0].stream.getvalue()
+            log_output = log_stream.stream.getvalue()
             if "WARNING" in log_output:
                 st.warning("Processing warnings:\n" + log_output)
