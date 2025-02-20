@@ -67,62 +67,26 @@ def extract_charges_from_pdf(file_bytes):
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
-    """
-    Extract metadata from page 1.
-    Tries to find a date in the form "January 2025" and converts it to "MM-YYYY".
-    Assumes the next non-empty line is the person's name.
-    If extraction fails, prompts the user for input.
-    Returns a dict with keys:
-      - "Bill_Month_Year": formatted as "MM-YYYY"
-      - "Person": the extracted name.
-    """
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-    
-    # Define possible date patterns.
-    date_patterns = [
-        r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$",
-        # You can add additional patterns here if needed.
-    ]
-    found_date = False
-    for i, line in enumerate(lines):
-        for pattern in date_patterns:
-            if re.match(pattern, line, re.IGNORECASE):
+        lines = text.splitlines()
+        month_regex = r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$"
+        for i, line in enumerate(lines):
+            candidate = line.strip()
+            if re.match(month_regex, candidate, re.IGNORECASE):
                 try:
-                    parsed_date = datetime.strptime(line, "%B %Y")
+                    parsed_date = datetime.strptime(candidate, "%B %Y")
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
                 except Exception:
-                    metadata["Bill_Month_Year"] = line
-                # Assume the next line is the person's name.
-                if i + 1 < len(lines):
-                    metadata["Person"] = lines[i+1]
-                found_date = True
+                    metadata["Bill_Month_Year"] = candidate
+                for j in range(i+1, len(lines)):
+                    candidate2 = lines[j].strip()
+                    if candidate2:
+                        metadata["Person"] = candidate2
+                        break
                 break
-        if found_date:
-            break
-
-    # Fallback: prompt the user if extraction failed.
-    if not metadata["Bill_Month_Year"]:
-        metadata["Bill_Month_Year"] = st.text_input("Enter the bill month and year (MM-YYYY):")
-    if not metadata["Person"]:
-        metadata["Person"] = st.text_input("Enter your name:")
-    
     return metadata
-
-# --- Mapping Persistence Functions ---
-def load_customer_ids(mapping_path):
-    if os.path.exists(mapping_path):
-        df_map = pd.read_csv(mapping_path)
-        return dict(zip(df_map["Person"], df_map["User_ID"]))
-    else:
-        return {}
-
-def save_customer_ids(mapping, mapping_path):
-    df_map = pd.DataFrame(mapping.items(), columns=["Person", "User_ID"])
-    os.makedirs(os.path.dirname(mapping_path) or ".", exist_ok=True)
-    df_map.to_csv(mapping_path, index=False)
 
 # --- Main PDF Processing Function ---
 def process_pdf(file_io):
@@ -143,16 +107,15 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
+    # Use Person for mapping User_ID.
     if "customer_ids" not in st.session_state:
-        st.session_state.customer_ids = load_customer_ids(MAPPING_PATH)
-    
+        st.session_state.customer_ids = {}
     person = metadata.get("Person", "")
     if person in st.session_state.customer_ids:
         user_id = st.session_state.customer_ids[person]
     else:
         user_id = str(uuid.uuid4())
         st.session_state.customer_ids[person] = user_id
-        save_customer_ids(st.session_state.customer_ids, MAPPING_PATH)
     
     existing = worksheet.get_all_records()
     bill_id = None
@@ -193,14 +156,6 @@ def append_row_to_sheet(row_dict):
 # --- Streamlit App Interface ---
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
-
-# Privacy Disclaimer
-st.markdown("""
-**Privacy Disclaimer:**  
-By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power.  
-Your information will not be shared publicly or sold.  
-This form is for informational and organizational purposes only and does not constitute legal representation.
-""")
 
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
 
