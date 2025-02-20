@@ -73,60 +73,61 @@ def extract_charges_from_pdf(file_bytes):
 def extract_metadata_from_pdf(file_bytes):
     """
     Extract metadata (Bill_Month_Year and Person) from page 1.
-    It scans all non-empty lines for a date in the form "January 2024" (or abbreviated "Jan 2024")
-    and then among subsequent lines looks for a candidate that appears to be a name.
-    If no candidate is found, it leaves the fields empty.
+    Scans all non-empty lines for various date patterns (with full/abbreviated month names,
+    with or without day). Then, after a date is found, searches subsequent lines for a candidate
+    that appears to be a person's name (ignoring common billing words). If no candidate is found,
+    defaults to "Unknown".
     """
     metadata = {"Bill_Month_Year": "", "Person": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
     
-    # Define date patterns.
-    date_patterns = [
-        r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$",
-        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}$"
+    # Define date patterns and corresponding formats.
+    patterns = [
+        (r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$", "%B %Y"),
+        (r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{4}$", "%b %Y"),
+        (r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}$", "%B %d, %Y"),
+        (r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}$", "%b %d, %Y")
     ]
-    
+    date_found = False
     date_index = None
     for i, line in enumerate(lines):
-        for pattern in date_patterns:
-            if re.match(pattern, line, re.IGNORECASE):
+        for pat, fmt in patterns:
+            if re.match(pat, line, re.IGNORECASE):
                 try:
-                    try:
-                        parsed_date = datetime.strptime(line, "%B %Y")
-                    except Exception:
-                        parsed_date = datetime.strptime(line, "%b %Y")
+                    parsed_date = datetime.strptime(line, fmt)
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
                 except Exception:
                     metadata["Bill_Month_Year"] = line
+                date_found = True
                 date_index = i
                 break
-        if metadata["Bill_Month_Year"]:
+        if date_found:
             break
 
-    # Look for a candidate name in lines after the date.
+    # Attempt to extract a candidate name from subsequent lines.
+    person_candidate = ""
     if date_index is not None:
         for line in lines[date_index+1:]:
-            # Skip lines that contain typical billing phrases.
-            if "for the period" in line.lower():
+            # Skip lines that contain common billing phrases.
+            if any(word in line.lower() for word in ["account", "bill", "period", "address", "issue", "summary"]):
                 continue
-            # Heuristic: if the line contains at least one space and is mostly uppercase, assume it's a name.
+            # Heuristic: a candidate name might have at least one space and be mostly uppercase.
             if " " in line:
                 letters = [ch for ch in line if ch.isalpha()]
                 if letters and all(ch.isupper() for ch in letters):
-                    metadata["Person"] = line
+                    person_candidate = line
                     break
-    # If no candidate found, leave Person empty.
+    if not person_candidate:
+        person_candidate = "Unknown"
+    metadata["Person"] = person_candidate
     return metadata
 
-# --- Generate a User_ID Without Storing the Actual Name ---
+# --- Generate a User_ID Without Recording the Actual Name ---
 def get_user_id(person):
-    """Compute a deterministic User_ID by hashing the person's name (if available)."""
-    if person:
-        return hashlib.sha256(person.encode('utf-8')).hexdigest()
-    else:
-        return str(uuid.uuid4())
+    """Compute a deterministic User_ID by hashing the person's name."""
+    return hashlib.sha256(person.encode('utf-8')).hexdigest()
 
 # --- Safe function to get all records from Google Sheets ---
 def get_all_records_safe(ws):
@@ -159,7 +160,6 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Generate User_ID using a hash of the person's name (without storing the name)
     person = metadata.get("Person", "")
     user_id = get_user_id(person)
     
