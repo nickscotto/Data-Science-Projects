@@ -1,4 +1,4 @@
-\import streamlit as st
+import streamlit as st
 import pdfplumber
 import re
 from collections import OrderedDict
