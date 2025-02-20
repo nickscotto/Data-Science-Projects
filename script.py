@@ -10,8 +10,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 import logging
 
-# Configure logging
+# Configure logging to output to Streamlit
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
 
 # --- Google Sheets Setup ---
 scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -67,7 +68,7 @@ def map_charge_description(desc):
     for partial, standard in CHARGE_TYPE_MAP.items():
         if partial in desc_lower:
             return standard
-    logging.warning(f"Unmapped charge description: {desc}")
+    logger.warning(f"Unmapped charge description: {desc}")
     return None
 
 def get_user_id(name):
@@ -93,7 +94,7 @@ def parse_charge_line(line):
                 return {"desc": raw_desc, "rate": rate_val, "amount": amt_val}
             except ValueError:
                 continue
-    logging.debug(f"Failed to parse line: {line}")
+    logger.debug(f"Failed to parse line: {line}")
     return None
 
 def extract_charge_tables(file_bytes):
@@ -163,7 +164,7 @@ def verify_charges(charges):
     extracted_charges = set(ch["Mapped"] for ch in charges)
     missing_charges = expected_charges - extracted_charges
     if missing_charges:
-        logging.warning(f"Missing charges: {missing_charges}")
+        logger.warning(f"Missing charges: {missing_charges}")
 
 # --- Metadata Extraction ---
 def extract_metadata_from_pdf(file_bytes):
@@ -270,9 +271,13 @@ if uploaded_file is not None:
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
         with st.spinner("Processing PDF..."):
+            # Clear previous logs for this upload
+            logger.handlers[0].stream.seek(0)
+            logger.handlers[0].stream.truncate(0)
             output_row = process_pdf(io.BytesIO(file_bytes))
             append_row_to_sheet(output_row)
             st.success("Thank you for your contribution!")
-            for record in logging.getLogger().handlers[0].buffer:
-                if record.levelno >= logging.WARNING:
-                    st.warning(record.getMessage())
+            # Display any warnings
+            log_output = logger.handlers[0].stream.getvalue()
+            if "WARNING" in log_output:
+                st.warning("Processing warnings:\n" + log_output)
