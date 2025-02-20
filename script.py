@@ -4,6 +4,7 @@ import re
 import uuid
 import hashlib
 from datetime import datetime
+from collections import OrderedDict
 import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
@@ -24,10 +25,12 @@ except Exception as e:
 worksheet = spreadsheet.sheet1
 
 # --- Mapping for Charge Types ---
+# Added mapping for "myp adjustment" so that it is captured and placed in PDF order.
 CHARGE_TYPE_MAP = {
     "customer charge": "Customer Charge",
     "distribution charge first": "Distribution Charge First kWh",
     "distribution charge last": "Distribution Charge Last kWh",
+    "myp adjustment": "MYP Adjustment First",
     "environmental surcharge": "Environmental Surcharge kWh",
     "empower maryland": "EmPOWER Maryland kWh",
     "administrative credit": "Administrative Credit",
@@ -93,15 +96,12 @@ def parse_charge_line(line):
 
 def combine_table_lines(table_lines):
     """
-    Builds each table row by accumulating lines until the candidate row parses successfully.
+    Builds each table row by accumulating lines until the candidate row parses correctly.
     """
     combined = []
     buffer = ""
     for line in table_lines:
-        if buffer:
-            candidate = buffer + " " + line
-        else:
-            candidate = line
+        candidate = (buffer + " " + line).strip() if buffer else line
         parsed = parse_charge_line(candidate)
         if parsed:
             combined.append(candidate)
@@ -131,7 +131,6 @@ def extract_charge_tables(file_bytes):
                     i += 1
                     while i < len(lines):
                         curr = lines[i]
-                        # If we hit another header, we assume this table ended.
                         if ("type of charge" in curr.lower() and "amount($" in curr.lower()):
                             break
                         table_lines.append(curr)
@@ -146,7 +145,7 @@ def extract_charge_tables(file_bytes):
 def extract_charges(file_bytes):
     """
     Processes all detected tables and, using both table-based extraction and a fallback full-text search,
-    returns a list of charge entries with keys "Mapped", "Rate", and "Amount".
+    returns a list (in PDF order) of charge entries with keys "Mapped", "Rate", and "Amount".
     """
     tables = extract_charge_tables(file_bytes)
     charges = []
@@ -176,7 +175,6 @@ def extract_charges(file_bytes):
         full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
     for key in expected_keys:
         if not any(ch["Mapped"] == key for ch in charges):
-            # Look for a line containing the key and an amount.
             pattern = re.compile(rf"(?P<desc>{re.escape(key)}.*?)\s+\$(?P<amount>-?[\d,]+(?:\.\d+)?)", re.IGNORECASE)
             match = pattern.search(full_text)
             if match:
@@ -242,33 +240,21 @@ def process_pdf(file_io):
     meta = extract_metadata_from_pdf(file_io)
     user_id = get_user_id(meta["Person"])
 
-    existing = get_all_records_safe(worksheet)
-    bill_id = None
-    for row in existing:
-        if row.get("Bill_Hash") == bill_hash:
-            bill_id = row.get("Bill_ID")
-            break
-    if not bill_id:
-        bill_id = str(uuid.uuid4())
+    # Use an OrderedDict to preserve the order.
+    output = OrderedDict()
+    output["User_ID"] = user_id
+    output["Bill_ID"] = str(uuid.uuid4())
+    output["Bill_Month_Year"] = meta["Bill_Month_Year"]
+    output["Bill_Hash"] = bill_hash
 
-    output = {
-        "User_ID": user_id,
-        "Bill_ID": bill_id,
-        "Bill_Month_Year": meta["Bill_Month_Year"],
-        "Bill_Hash": bill_hash
-    }
+    # Add charge columns in the order they appear in the PDF.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
             amt_col = f"{mapped} Amount"
             rate_col = f"{mapped} Rate"
-            # If a key already exists, update only if the new amount isn’t zero.
-            if amt_col in output:
-                if ch["Amount"] != 0.0:
-                    output[amt_col] = ch["Amount"]
-                    if ch["Rate"]:
-                        output[rate_col] = ch["Rate"]
-            else:
+            # Only add if not already present
+            if amt_col not in output:
                 output[amt_col] = ch["Amount"]
                 if ch["Rate"]:
                     output[rate_col] = ch["Rate"]
@@ -279,12 +265,12 @@ def append_row_to_sheet(row_dict):
     if existing:
         headers = list(existing[0].keys())
     else:
-        headers = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"]
-    for key, val in row_dict.items():
-        if key not in headers and val != "":
-            headers.append(key)
-    if not existing:
+        headers = list(row_dict.keys())
         worksheet.append_row(headers)
+    # Add any new keys in order.
+    for key in row_dict.keys():
+        if key not in headers:
+            headers.append(key)
     row_values = [str(row_dict.get(h, "")) for h in headers]
     worksheet.append_row(row_values)
 
