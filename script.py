@@ -99,11 +99,9 @@ def combine_table_lines(table_lines):
     """
     combined = []
     for line in table_lines:
-        # If current line parses, add it as a new row.
         if parse_charge_line(line):
             combined.append(line)
         else:
-            # Otherwise, assume it's a continuation of the previous line.
             if combined:
                 combined[-1] = combined[-1] + " " + line
             else:
@@ -132,7 +130,6 @@ def extract_charge_tables(file_bytes):
                     i += 1
                     while i < len(lines):
                         curr = lines[i]
-                        # Stop if a new header is encountered.
                         if ("type of charge" in curr.lower() and "amount($" in curr.lower()):
                             break
                         table_lines.append(curr)
@@ -156,7 +153,6 @@ def extract_charges(file_bytes):
         for line in table:
             parsed = parse_charge_line(line)
             if parsed:
-                # Clean the description: remove digits from kWh parts.
                 cleaned_desc = re.sub(r"\d+\s*kWh", "kWh", parsed["desc"], flags=re.IGNORECASE).strip()
                 mapped = map_charge_description(cleaned_desc)
                 if mapped:
@@ -240,12 +236,17 @@ def process_pdf(file_io):
         "Bill_Month_Year": meta["Bill_Month_Year"],
         "Bill_Hash": bill_hash
     }
+    # Use a "max" logic for duplicate keys so that a nonzero total replaces a zero value.
     for ch in charges:
         mapped = ch.get("Mapped")
         if mapped:
             amt_col = f"{mapped} Amount"
             rate_col = f"{mapped} Rate"
-            output[amt_col] = ch["Amount"]
+            if amt_col in output:
+                # Update only if the new amount is greater than the existing value.
+                output[amt_col] = max(output[amt_col], ch["Amount"])
+            else:
+                output[amt_col] = ch["Amount"]
             if ch["Rate"]:
                 output[rate_col] = ch["Rate"]
     return output
