@@ -27,34 +27,25 @@ def standardize_charge_type(charge_type):
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use (Updated) ---
+# --- Key Helper: Extract Total Use (Updated with Debug) ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
-        for page in pdf.pages:
+        for page_num, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ""
             lines = [l.strip() for l in text.splitlines() if l.strip()]
+            st.write(f"Debug - Page {page_num} lines:")  # Debug output in Streamlit
             for i, line in enumerate(lines):
-                # Look for "Total Use" (case insensitive) in the line
+                st.write(f"Line {i}: '{line}'")  # Print each line for inspection
                 if "total use" in line.lower():
-                    # Try to get the next line or the rest of the current line for the value
-                    if i + 1 < len(lines):
+                    # Look for a number on the same line or next line
+                    match = re.search(r'\b(\d+)\b', line)
+                    if match:
+                        return match.group(1)
+                    elif i + 1 < len(lines):
                         next_line = lines[i + 1]
-                        # Extract digits from the next line (assuming it’s the value)
-                        value_match = re.search(r'\b(\d+)\b', next_line)
-                        if value_match:
-                            return value_match.group(1)
-                    # If no next line, check if value is on the same line
-                    same_line_match = re.search(r'total\s*use\s*(\d+)', line.lower())
-                    if same_line_match:
-                        return same_line_match.group(1)
-            # Alternative: Look for the table-like structure more flexibly
-            for i in range(len(lines) - 1):
-                if "number of days" in lines[i].lower() and "total use" in lines[i + 1].lower():
-                    # Assume values are in the next line after "Total Use"
-                    if i + 2 < len(lines):
-                        value_match = re.search(r'\b(\d+)\b', lines[i + 2])
-                        if value_match:
-                            return value_match.group(1)
+                        match = re.search(r'\b(\d+)\b', next_line)
+                        if match:
+                            return match.group(1)
     return ""  # Return empty string if not found
 
 # --- PDF Extraction Functions ---
