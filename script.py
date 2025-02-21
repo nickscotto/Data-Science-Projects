@@ -18,16 +18,28 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
-# --- Helper: Standardize Charge Type Names ---
+# --- Helper: Standardize Charge Type Names (Updated) ---
 def standardize_charge_type(charge_type):
-    if "Distribution Charge" in charge_type or "Transmission" in charge_type:
+    charge_type = charge_type.strip()
+    # If "First" or "Last" is explicitly mentioned, keep it
+    if "First" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+        return "Distribution Charge First kWh" if "Distribution" in charge_type else "Transmission First kWh" if "Transmission" in charge_type else charge_type
+    elif "Last" in charge_type:
+        charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+        return "Distribution Charge Last kWh" if "Distribution" in charge_type else "Transmission Last kWh" if "Transmission" in charge_type else charge_type
+    # If neither "First" nor "Last" is present, default to "First kWh"
+    elif "Distribution Charge" in charge_type:
+        return "Distribution Charge First kWh"
+    elif "Transmission" in charge_type:
+        return "Transmission First kWh"
+    # For other charges, remove "First/Last/Next" and standardize
     else:
         charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use (No Debug) ---
+# --- Key Helper: Extract Total Use ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         if len(pdf.pages) < 2:
