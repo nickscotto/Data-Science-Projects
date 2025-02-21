@@ -39,7 +39,7 @@ def standardize_charge_type(charge_type):
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use ---
+# --- Key Helper: Extract Total Use (Updated for Both Formats) ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         if len(pdf.pages) < 2:
@@ -47,16 +47,22 @@ def extract_total_use_from_pdf(file_bytes):
         page = pdf.pages[1]  # Page 2 (index 1)
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
+        # Try the condensed header pattern first
         for i, line in enumerate(lines):
-            # Look for the first header line
             if "meter energy end start number total" in line.lower():
-                # Check if the next line is the second header
                 if i + 1 < len(lines) and "number type date date of days use" in lines[i + 1].lower():
-                    # The next line (i + 2) should be the data row
                     if i + 2 < len(lines):
                         tokens = lines[i + 2].split()
-                        if tokens and tokens[-1].isdigit():  # Last token should be Total Use
+                        if tokens and tokens[-1].isdigit():
                             return tokens[-1]
+        # If condensed pattern fails, look for a data row with meter number and total use
+        for line in lines:
+            tokens = line.split()
+            if (len(tokens) >= 6 and 
+                tokens[0].startswith("1ND") and  # Meter number pattern
+                "kWh" in " ".join(tokens) and    # Energy type includes "kWh"
+                tokens[-1].isdigit()):           # Last token is numeric (Total Use)
+                return tokens[-1]
     return ""  # Return empty string if not found
 
 # --- PDF Extraction Functions ---
