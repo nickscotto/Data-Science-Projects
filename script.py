@@ -30,25 +30,18 @@ def standardize_charge_type(charge_type):
 # --- Key Helper: Extract Total Use ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
-        for page_num, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             text = page.extract_text() or ""
-            # Debug: Print full text of the page
-            print(f"DEBUG: Page {page_num} text:\n{text}\n{'-'*40}")
-            
-            # Debug: Print each non-empty line with its index
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            for i, line in enumerate(lines):
-                print(f"DEBUG: Page {page_num} - Line {i}: {line}")
-            
-            # Scan for a heading line containing both 'Total' and 'Use'
-            for i in range(len(lines) - 1):
-                if re.search(r'(?i)\btotal\b', lines[i]) and re.search(r'(?i)\buse\b', lines[i]):
-                    print(f"DEBUG: Found header on Page {page_num} - Line {i}: {lines[i]}")
-                    print(f"DEBUG: Next line (expected usage number): {lines[i+1]}")
-                    tokens = re.findall(r'\d+(?:,\d+)?', lines[i + 1])
-                    print(f"DEBUG: Tokens found: {tokens}")
-                    if tokens:
-                        return tokens[-1].replace(",", "")
+            # Join lines to avoid issues with newlines splitting "Total" and "Use"
+            text_no_newlines = " ".join(text.splitlines())
+            if "Total Use" in text_no_newlines:
+                # Get everything after "Total Use"
+                after = text_no_newlines.split("Total Use", 1)[1].strip()
+                # Find all sequences of digits
+                digit_tokens = re.findall(r'\d+', after)
+                # Return the 6th set of digits (index 5) if it exists
+                if len(digit_tokens) >= 6:
+                    return digit_tokens[5]
     return ""
 
 # --- PDF Extraction Functions ---
