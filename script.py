@@ -145,4 +145,88 @@ def process_pdf(file_io):
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
     # Build user_id from account number
-    account_number
+    account_number = metadata.get("Account_Number", "").replace(" ", "")
+    if "customer_ids" not in st.session_state:
+        st.session_state.customer_ids = {}
+    if account_number:
+        if account_number in st.session_state.customer_ids:
+            user_id = st.session_state.customer_ids[account_number]
+        else:
+            user_id = str(uuid.uuid4())
+            st.session_state.customer_ids[account_number] = user_id
+    else:
+        user_id = str(uuid.uuid4())
+
+    # Check for existing bill
+    existing = worksheet.get_all_records()
+    bill_id = None
+    for row in existing:
+        if row.get("Bill_Hash") == bill_hash:
+            bill_id = row.get("Bill_ID")
+            break
+    if not bill_id:
+        bill_id = str(uuid.uuid4())
+
+    # Build output row
+    output_row = {
+        "User_ID": user_id,
+        "Bill_ID": bill_id,
+        "Bill_Month_Year": metadata.get("Bill_Month_Year", ""),
+        "Bill_Hash": bill_hash,
+        "Total Use": total_use
+    }
+    # Add charges
+    for ct in consolidated:
+        if consolidated[ct]["Amount"] != 0:
+            output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
+        if consolidated[ct]["Rate"]:
+            output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
+
+    return output_row
+
+# --- Sheet Append Function ---
+def append_row_to_sheet(row_dict):
+    meta_cols = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
+    current_data = worksheet.get_all_values()
+    if current_data:
+        headers = current_data[0]
+        existing_rows = current_data[1:]
+    else:
+        headers = []
+        existing_rows = []
+
+    charge_cols = [col for col in row_dict if col not in meta_cols]
+    existing_charge_cols = [col for col in headers if col not in meta_cols]
+    new_charge_cols = [col for col in charge_cols if col not in existing_charge_cols]
+    all_charge_cols = existing_charge_cols + new_charge_cols
+    full_headers = meta_cols + all_charge_cols
+
+    if full_headers != headers:
+        worksheet.update("A1", [full_headers])
+        if existing_rows:
+            for i, row in enumerate(existing_rows, start=2):
+                row_dict_existing = dict(zip(headers, row))
+                padded_row = [str(row_dict_existing.get(h, "")) for h in full_headers]
+                worksheet.update(f"A{i}", [padded_row])
+
+    row_values = [str(row_dict.get(h, "")) for h in full_headers]
+    worksheet.append_row(row_values)
+
+# --- Streamlit App Interface ---
+st.title("Delmarva BillWatch")
+st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
+
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.read()
+    file_io = io.BytesIO(file_bytes)
+    bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
+    existing = worksheet.get_all_records()
+    duplicate = any(r.get("Bill_Hash") == bill_hash for r in existing)
+    if duplicate:
+        st.warning("This bill has already been uploaded. Duplicate not added.")
+    else:
+        output_row = process_pdf(file_io)
+        append_row_to_sheet(output_row)
+        st.success("Thank you for your contribution!")
