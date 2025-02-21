@@ -30,14 +30,23 @@ def standardize_charge_type(charge_type):
 # --- Key Helper: Extract Total Use ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
-        for page in pdf.pages:
-            # Get non-empty lines
-            lines = [l.strip() for l in (page.extract_text() or "").splitlines() if l.strip()]
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            # Debug: Print full text of the page
+            print(f"DEBUG: Page {page_num} text:\n{text}\n{'-'*40}")
+            
+            # Debug: Print each non-empty line with its index
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            for i, line in enumerate(lines):
+                print(f"DEBUG: Page {page_num} - Line {i}: {line}")
+            
             # Scan for a heading line containing both 'Total' and 'Use'
             for i in range(len(lines) - 1):
                 if re.search(r'(?i)\btotal\b', lines[i]) and re.search(r'(?i)\buse\b', lines[i]):
-                    # Next line should contain the usage number
+                    print(f"DEBUG: Found header on Page {page_num} - Line {i}: {lines[i]}")
+                    print(f"DEBUG: Next line (expected usage number): {lines[i+1]}")
                     tokens = re.findall(r'\d+(?:,\d+)?', lines[i + 1])
+                    print(f"DEBUG: Tokens found: {tokens}")
                     if tokens:
                         return tokens[-1].replace(",", "")
     return ""
