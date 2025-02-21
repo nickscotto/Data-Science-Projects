@@ -4,6 +4,7 @@ import re
 import uuid
 import hashlib
 from datetime import datetime
+from dateutil.parser import parse as date_parse  # new import
 import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
@@ -72,22 +73,11 @@ def extract_metadata_from_pdf(file_bytes):
         for line in lines:
             if "Bill Issue date:" in line:
                 date_text = line.split("Bill Issue date:")[-1].strip()
-                date_patterns = [
-                    (r"\d{1,2}/\d{1,2}/\d{4}", "%m/%d/%Y"),
-                    (r"\w+ \d{1,2},? \d{4}", "%B %d, %Y"),
-                    (r"\w+ \d{4}", "%B %Y"),
-                    (r"\d{4}-\d{1,2}-\d{1,2}", "%Y-%m-%d"),
-                    (r"\d{1,2}-\w+-\d{4}", "%d-%b-%Y")
-                ]
-                for pattern, fmt in date_patterns:
-                    match = re.search(pattern, date_text)
-                    if match:
-                        try:
-                            parsed_date = datetime.strptime(match.group(), fmt)
-                            metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
-                            break
-                        except ValueError:
-                            continue
+                try:
+                    parsed_date = date_parse(date_text, fuzzy=True)
+                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
+                except Exception:
+                    pass
                 break
 
         # Extract Person's Name by finding the line above the one containing "Account"
