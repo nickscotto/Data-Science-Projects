@@ -20,9 +20,7 @@ worksheet = spreadsheet.sheet1
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
-    # For "Distribution Charge" or "Transmission" preserve the words First/Last; otherwise, remove them.
     if "Distribution Charge" in charge_type or "Transmission" in charge_type:
-        # Remove numeric kWh details only.
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
         return charge_type
     else:
@@ -30,23 +28,31 @@ def standardize_charge_type(charge_type):
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
         return charge_type
 
-# --- New Helper: Extract Total Use ---
+# --- Updated Helper: Extract Total Use ---
 def extract_total_use_from_pdf(file_bytes):
     total_use = ""
     with pdfplumber.open(file_bytes) as pdf:
-        # Join text from all pages into one string.
+        # Combine text from all pages and normalize whitespace.
         text = " ".join([page.extract_text() or "" for page in pdf.pages])
         text = re.sub(r'\s+', ' ', text)
-        # Look for a pattern "Use (kWh)" and capture the last number that follows.
-        m = re.search(r'Use \(kWh\).*?(\d+)(?!\S)', text, re.IGNORECASE)
-        if m:
-            total_use = m.group(1)
+        # Try multiple patterns for robustness.
+        patterns = [
+            r"Total Use\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Usage\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Use\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Total Consumption\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Consumption\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                total_use = m.group(1).replace(",", "")
+                break
     return total_use
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
-    # Regex updated to capture an optional trailing minus for both rate and amount.
     regex_pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
     )
@@ -70,13 +76,11 @@ def extract_charges_from_pdf(file_bytes):
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
                             
-                            # Process rate: if a trailing minus is present, convert it.
                             if rate_val.endswith("−") or rate_val.endswith("-"):
                                 rate_val = rate_val.rstrip("−-")
                                 if not rate_val.startswith("-"):
                                     rate_val = "-" + rate_val
                             
-                            # Process amount similarly.
                             if raw_amount.endswith("−") or raw_amount.endswith("-"):
                                 raw_amount = raw_amount.rstrip("−-")
                                 if not raw_amount.startswith("-"):
@@ -99,7 +103,6 @@ def extract_metadata_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
-        # Extract Bill Issue Date using a case-insensitive regex.
         for line in lines:
             match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
             if match:
@@ -110,7 +113,6 @@ def extract_metadata_from_pdf(file_bytes):
                 except Exception:
                     pass
                 break
-        # Extract Account Number using a case-insensitive regex.
         for line in lines:
             match = re.search(r"Account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
             if match:
@@ -119,7 +121,6 @@ def extract_metadata_from_pdf(file_bytes):
                 break
     return metadata
 
-# --- Main PDF Processing Function ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     
@@ -127,7 +128,6 @@ def process_pdf(file_io):
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
     
-    # Consolidate charges, preserving order from PDF.
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -140,7 +140,6 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Use account number to generate a consistent User_ID.
     account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
@@ -153,7 +152,6 @@ def process_pdf(file_io):
     else:
         user_id = str(uuid.uuid4())
     
-    # Check for existing bill and assign Bill_ID.
     existing = worksheet.get_all_records()
     bill_id = None
     for row in existing:
@@ -163,7 +161,6 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
     
-    # Build output row with metadata first.
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
@@ -171,7 +168,6 @@ def process_pdf(file_io):
         "Bill_Hash": bill_hash,
         "Total Use": total_use
     }
-    # Add charges in the order they appear in consolidated.
     for ct in consolidated:
         if consolidated[ct]["Amount"] != 0:
             output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
@@ -179,7 +175,6 @@ def process_pdf(file_io):
             output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
     return output_row
 
-# --- Updated Sheet Append Function ---
 def append_row_to_sheet(row_dict):
     metadata_columns = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
     current_data = worksheet.get_all_values()
@@ -189,14 +184,11 @@ def append_row_to_sheet(row_dict):
     else:
         headers = []
         existing_rows = []
-    # Get charge columns from row_dict.
     charge_columns = [col for col in row_dict.keys() if col not in metadata_columns]
     existing_charge_columns = [col for col in headers if col not in metadata_columns]
-    # Append new charge columns in the order they appear.
     new_charge_columns = [col for col in charge_columns if col not in existing_charge_columns]
     all_charge_columns = existing_charge_columns + new_charge_columns
     full_headers = metadata_columns + all_charge_columns
-    # Update headers if new columns were added.
     if full_headers != headers:
         worksheet.update("A1", [full_headers])
         if existing_rows:
@@ -204,11 +196,9 @@ def append_row_to_sheet(row_dict):
                 row_dict_existing = dict(zip(headers, row))
                 padded_row = [str(row_dict_existing.get(header, "")) for header in full_headers]
                 worksheet.update(f"A{i}", [padded_row])
-    # Append the new row.
     row_values = [str(row_dict.get(header, "")) for header in full_headers]
     worksheet.append_row(row_values)
 
-# --- Streamlit App Interface ---
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
 
