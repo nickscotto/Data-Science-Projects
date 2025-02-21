@@ -24,6 +24,26 @@ def standardize_charge_type(charge_type):
     charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
+# --- New Helper: Extract Total Use ---
+def extract_total_use_from_pdf(file_bytes):
+    total_use = ""
+    with pdfplumber.open(file_bytes) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = text.splitlines()
+            for line in lines:
+                if "Use (kWh)" in line:
+                    tokens = line.split()
+                    candidate = tokens[-1].replace(",", "")
+                    try:
+                        # Check if candidate is numeric.
+                        float(candidate)
+                        total_use = candidate
+                        return total_use
+                    except ValueError:
+                        continue
+    return total_use
+
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
@@ -111,6 +131,7 @@ def process_pdf(file_io):
     
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
+    total_use = extract_total_use_from_pdf(file_io)
     
     # Consolidate charges, preserving order from PDF
     consolidated = {}
@@ -153,7 +174,8 @@ def process_pdf(file_io):
         "User_ID": user_id,
         "Bill_ID": bill_id,
         "Bill_Month_Year": metadata.get("Bill_Month_Year", ""),
-        "Bill_Hash": bill_hash
+        "Bill_Hash": bill_hash,
+        "Total Use": total_use
     }
     # Add charges in the order they appear in consolidated
     for ct in consolidated:
@@ -165,7 +187,7 @@ def process_pdf(file_io):
 
 # --- Updated Sheet Append Function ---
 def append_row_to_sheet(row_dict):
-    metadata_columns = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash"]
+    metadata_columns = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
     current_data = worksheet.get_all_values()
     if current_data:
         headers = current_data[0]
