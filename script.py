@@ -39,7 +39,7 @@ def standardize_charge_type(charge_type):
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use (With Debug) ---
+# --- Key Helper: Extract Total Use (More Robust) ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         if len(pdf.pages) < 2:
@@ -47,27 +47,32 @@ def extract_total_use_from_pdf(file_bytes):
         page = pdf.pages[1]  # Page 2 (index 1)
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
-        # Debug output to see page 2 content
-        st.write("Debug - Page 2 lines for this PDF:")
+        
+        # Try header-based extraction
         for i, line in enumerate(lines):
-            st.write(f"Line {i}: '{line}'")
-        # Try the condensed header pattern first
-        for i, line in enumerate(lines):
-            if "meter energy end start number total" in line.lower():
-                if i + 1 < len(lines) and "number type date date of days use" in lines[i + 1].lower():
+            # Flexible header check: look for key phrases
+            if "meter energy" in line.lower() and "number total" in line.lower():
+                if i + 1 < len(lines) and "number type" in lines[i + 1].lower() and "days use" in lines[i + 1].lower():
                     if i + 2 < len(lines):
+                        # Extract tokens from data line
                         tokens = lines[i + 2].split()
-                        if tokens and tokens[-1].isdigit():
-                            return tokens[-1]
-        # If condensed pattern fails, look for a data row with meter number and total use
+                        # Find the last numeric token before non-numeric text
+                        for j in range(len(tokens) - 1, -1, -1):
+                            if tokens[j].isdigit():
+                                return tokens[j]
+        
+        # Fallback: look for a data row with "1ND..." and "kWh"
         for line in lines:
             tokens = line.split()
             if (len(tokens) >= 6 and 
-                tokens[0].startswith("1ND") and  # Meter number pattern
-                "kWh" in " ".join(tokens) and    # Energy type includes "kWh"
-                tokens[-1].isdigit()):           # Last token is numeric (Total Use)
-                return tokens[-1]
-    return ""  # Return empty string if not found
+                tokens[0].startswith("1ND") and 
+                "kWh" in " ".join(tokens)):
+                # Find the last numeric token
+                for j in range(len(tokens) - 1, -1, -1):
+                    if tokens[j].isdigit():
+                        return tokens[j]
+        
+        return ""  # Return empty string if not found
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
