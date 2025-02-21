@@ -21,36 +21,39 @@ worksheet = spreadsheet.sheet1
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     if "Distribution Charge" in charge_type or "Transmission" in charge_type:
-        # Keep 'First/Last' if present, remove numeric kWh only
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     else:
-        # Remove 'First/Last/Next' and numeric kWh
         charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Updated Helper: Extract Total Use ---
+# --- Key Helper: Extract Total Use ---
 def extract_total_use_from_pdf(file_bytes):
-    total_use = ""
+    """
+    Looks for a line with 'Total', then the next line is 'Use', 
+    then returns the last numeric token from the following line.
+    Example lines:
+        <some text>
+        Total
+           Use
+        1ND360376614 Use (kWh) Feb 13 Jan 15 30 4905
+    """
     with pdfplumber.open(file_bytes) as pdf:
-        # Combine text from all pages
-        text = " ".join(page.extract_text() or "" for page in pdf.pages)
-        # Normalize whitespace
-        text = re.sub(r"\s+", " ", text)
+        for page in pdf.pages:
+            lines = (page.extract_text() or "").splitlines()
+            # Remove blank lines
+            lines = [l.strip() for l in lines if l.strip()]
 
-        # Try multiple patterns for total usage
-        patterns = [
-            r"Total\s*Use[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
-            r"Usage[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
-            r"Use[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
-            r"Consumption[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                total_use = match.group(1).replace(",", "")
-                break
-    return total_use
+            for i in range(len(lines) - 2):
+                # Check if this line says 'Total' (case-insensitive) 
+                # and the next line says 'Use'
+                if re.fullmatch(r'(?i)total', lines[i]) and re.fullmatch(r'(?i)use', lines[i+1]):
+                    # The numeric usage should be on the next line (i+2)
+                    tokens = re.findall(r'\d+(?:,\d+)*', lines[i+2])
+                    if tokens:
+                        # Return the last numeric token found, minus commas
+                        return tokens[-1].replace(",", "")
+    return ""
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
@@ -77,14 +80,12 @@ def extract_charges_from_pdf(file_bytes):
                             desc = match.group("desc").strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
-
-                            # Handle trailing minus in rate
+                            
                             if rate_val.endswith("−") or rate_val.endswith("-"):
                                 rate_val = rate_val.rstrip("−-")
                                 if not rate_val.startswith("-"):
                                     rate_val = "-" + rate_val
-
-                            # Handle trailing minus in amount
+                            
                             if raw_amount.endswith("−") or raw_amount.endswith("-"):
                                 raw_amount = raw_amount.rstrip("−-")
                                 if not raw_amount.startswith("-"):
@@ -93,7 +94,6 @@ def extract_charges_from_pdf(file_bytes):
                                 amount = float(raw_amount)
                             except ValueError:
                                 continue
-                            # Filter out lines we don't want
                             if any(k in desc.lower() for k in ["page", "year", "meter", "temp", "date"]):
                                 continue
                             rows.append({
@@ -108,8 +108,6 @@ def extract_metadata_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
-
-        # Extract Bill Issue Date
         for line in lines:
             match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
             if match:
@@ -120,14 +118,11 @@ def extract_metadata_from_pdf(file_bytes):
                 except:
                     pass
                 break
-
-        # Extract Account Number
         for line in lines:
             match = re.search(r"Account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
             if match:
                 metadata["Account_Number"] = match.group(1).strip()
                 break
-
     return metadata
 
 # --- Main PDF Processing Function ---
@@ -150,7 +145,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
-    # Build user_id based on account number
+    # Build user_id from account number
     account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
@@ -181,7 +176,6 @@ def process_pdf(file_io):
         "Bill_Hash": bill_hash,
         "Total Use": total_use
     }
-
     # Add charges
     for ct in consolidated:
         if consolidated[ct]["Amount"] != 0:
@@ -202,14 +196,12 @@ def append_row_to_sheet(row_dict):
         headers = []
         existing_rows = []
 
-    # Charge columns
     charge_columns = [col for col in row_dict if col not in metadata_columns]
     existing_charge_columns = [col for col in headers if col not in metadata_columns]
     new_charge_columns = [col for col in charge_columns if col not in existing_charge_columns]
     all_charge_columns = existing_charge_columns + new_charge_columns
     full_headers = metadata_columns + all_charge_columns
 
-    # Update headers if new columns added
     if full_headers != headers:
         worksheet.update("A1", [full_headers])
         if existing_rows:
@@ -218,7 +210,6 @@ def append_row_to_sheet(row_dict):
                 padded_row = [str(row_dict_existing.get(h, "")) for h in full_headers]
                 worksheet.update(f"A{i}", [padded_row])
 
-    # Append new row
     row_values = [str(row_dict.get(h, "")) for h in full_headers]
     worksheet.append_row(row_values)
 
