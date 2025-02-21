@@ -4,7 +4,7 @@ import re
 import uuid
 import hashlib
 from datetime import datetime
-from dateutil.parser import parse as date_parse  # new import
+from dateutil.parser import parse as date_parse  # new import for fuzzy date parsing
 import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
@@ -69,10 +69,11 @@ def extract_metadata_from_pdf(file_bytes):
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
 
-        # Extract Bill Issue Date from the line containing "Bill Issue date:"
+        # Use a case-insensitive regex to extract any text after "Bill Issue date:"
         for line in lines:
-            if "Bill Issue date:" in line:
-                date_text = line.split("Bill Issue date:")[-1].strip()
+            match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
+            if match:
+                date_text = match.group(1).strip()
                 try:
                     parsed_date = date_parse(date_text, fuzzy=True)
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
@@ -80,7 +81,7 @@ def extract_metadata_from_pdf(file_bytes):
                     pass
                 break
 
-        # Extract Person's Name by finding the line above the one containing "Account"
+        # Extract Person's Name by taking the non-empty line immediately above the one containing "Account"
         for i, line in enumerate(lines):
             if "Account" in line:
                 j = i - 1
