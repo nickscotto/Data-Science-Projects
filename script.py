@@ -9,10 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # --- Google Sheets Setup ---
-scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
 gc = gspread.authorize(creds)
 
@@ -51,7 +48,7 @@ def extract_charges_from_pdf(file_bytes):
                         if match:
                             desc = match.group("desc").strip()
                             rate_val = match.group("rate") or ""
-                            amount_str = match.group("amount").replace(",", "").replace("−", "")
+                            amount_str = match.group("amount").replace(",", "").replace("−", "-")
                             try:
                                 amount = float(amount_str)
                             except ValueError:
@@ -71,55 +68,33 @@ def extract_metadata_from_pdf(file_bytes):
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
         
-        # Keywords to locate the bill date
-        date_keywords = ["bill date", "statement date", "date of bill"]
+        # Expanded date patterns
         date_patterns = [
-            r"\d{1,2}/\d{1,2}/\d{4}",  # MM/DD/YYYY
-            r"\w+ \d{1,2}, \d{4}",     # January 1, 2024
-            r"\w+ \d{4}"               # January 2024
+            r"\d{1,2}/\d{1,2}/\d{4}",       # 01/01/2024
+            r"\w+ \d{1,2},? \d{4}",         # January 1, 2024 or January 1 2024
+            r"\w+ \d{4}",                   # January 2024
+            r"\d{4}-\d{1,2}-\d{1,2}",       # 2024-01-01
+            r"\d{1,2}-\w+-\d{4}",           # 01-Jan-2024
         ]
+        date_formats = ["%m/%d/%Y", "%B %d, %Y", "%B %d %Y", "%B %Y", "%Y-%m-%d", "%d-%b-%Y"]
         
-        for line in lines:
-            line = line.strip()
-            if any(keyword.lower() in line.lower() for keyword in date_keywords):
-                for pattern in date_patterns:
-                    match = re.search(pattern, line)
-                    if match:
-                        date_str = match.group()
+        for i, line in enumerate(lines):
+            for pattern in date_patterns:
+                match = re.search(pattern, line)
+                if match:
+                    date_str = match.group()
+                    for fmt in date_formats:
                         try:
-                            parsed_date = datetime.strptime(date_str, "%m/%d/%Y")
+                            parsed_date = datetime.strptime(date_str, fmt)
                             metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
+                            # Look for person's name in subsequent lines
+                            for j in range(i + 1, min(i + 5, len(lines))):
+                                candidate = lines[j].strip()
+                                if candidate:
+                                    metadata["Person"] = candidate
+                                    return metadata
                         except ValueError:
-                            try:
-                                parsed_date = datetime.strptime(date_str, "%B %d, %Y")
-                                metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
-                            except ValueError:
-                                try:
-                                    parsed_date = datetime.strptime(date_str, "%B %Y")
-                                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
-                                except ValueError:
-                                    pass
-                        if metadata["Bill_Month_Year"]:
-                            break
-            if metadata["Bill_Month_Year"]:
-                break
-        
-        # Extract person's name (next non-empty line after date, if found)
-        if metadata["Bill_Month_Year"]:
-            for i, line in enumerate(lines):
-                if metadata["Bill_Month_Year"] in line:
-                    for j in range(i+1, len(lines)):
-                        candidate = lines[j].strip()
-                        if candidate:
-                            metadata["Person"] = candidate
-                            break
-                    break
-        else:
-            # Fallback for person's name if date not found
-            for line in lines:
-                if "Account Holder" in line or "Customer Name" in line:
-                    metadata["Person"] = line.split(":")[-1].strip()
-                    break
+                            continue
     return metadata
 
 # --- Main PDF Processing Function ---
@@ -129,7 +104,7 @@ def process_pdf(file_io):
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     
-    # Consolidate charges
+    # Consolidate charges, preserving order from PDF
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -142,7 +117,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Normalize person's name for User ID consistency
+    # Normalize person's name for User ID
     person = metadata.get("Person", "").strip().lower()
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
@@ -162,18 +137,19 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
     
-    # Build output row
+    # Build output row with metadata first
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
         "Bill_Month_Year": metadata.get("Bill_Month_Year", ""),
         "Bill_Hash": bill_hash
     }
-    for ct, data in consolidated.items():
-        if data["Amount"] != 0:
-            output_row[f"{ct} Amount"] = data["Amount"]
-        if data["Rate"]:
-            output_row[f"{ct} Rate"] = data["Rate"]
+    # Add charges in the order they appear in consolidated
+    for ct in consolidated:
+        if consolidated[ct]["Amount"] != 0:
+            output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
+        if consolidated[ct]["Rate"]:
+            output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
     return output_row
 
 # --- Updated Sheet Append Function ---
@@ -187,20 +163,25 @@ def append_row_to_sheet(row_dict):
         headers = []
         existing_rows = []
 
+    # Get charge columns in order from row_dict
     charge_columns = [col for col in row_dict.keys() if col not in metadata_columns]
     existing_charge_columns = [col for col in headers if col not in metadata_columns]
-    new_charge_columns = list(set(charge_columns) - set(existing_charge_columns))
-    all_charge_columns = sorted(existing_charge_columns + new_charge_columns)
+    
+    # Append new charge columns in the order they appear in the PDF
+    new_charge_columns = [col for col in charge_columns if col not in existing_charge_columns]
+    all_charge_columns = existing_charge_columns + new_charge_columns
     full_headers = metadata_columns + all_charge_columns
     
+    # Update headers if new columns were added
     if full_headers != headers:
         worksheet.update("A1", [full_headers])
         if existing_rows:
             for i, row in enumerate(existing_rows, start=2):
-                row_dict = dict(zip(headers, row))
-                padded_row = [str(row_dict.get(header, "")) for header in full_headers]
+                row_dict_existing = dict(zip(headers, row))
+                padded_row = [str(row_dict_existing.get(header, "")) for header in full_headers]
                 worksheet.update(f"A{i}", [padded_row])
     
+    # Append the new row
     row_values = [str(row_dict.get(header, "")) for header in full_headers]
     worksheet.append_row(row_values)
 
