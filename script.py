@@ -39,7 +39,7 @@ def standardize_charge_type(charge_type):
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use (Updated for Both Formats) ---
+# --- Key Helper: Extract Total Use (With Debug) ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         if len(pdf.pages) < 2:
@@ -47,6 +47,10 @@ def extract_total_use_from_pdf(file_bytes):
         page = pdf.pages[1]  # Page 2 (index 1)
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
+        # Debug output to see page 2 content
+        st.write("Debug - Page 2 lines for this PDF:")
+        for i, line in enumerate(lines):
+            st.write(f"Line {i}: '{line}'")
         # Try the condensed header pattern first
         for i, line in enumerate(lines):
             if "meter energy end start number total" in line.lower():
