@@ -27,10 +27,11 @@ def standardize_charge_type(charge_type):
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
-    # Updated regex: allow optional trailing minus (either "−" or "-") after the number.
+    # Updated regex:
+    #   - For rate: capture digits (and decimal point) followed by an optional trailing minus (either "−" or "-")
+    #   - For amount: same as before, handling optional trailing minus.
     regex_pattern = (
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?"
-        r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
+        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
     )
     with pdfplumber.open(file_bytes) as pdf:
         for page_index in [1, 2]:
@@ -51,14 +52,20 @@ def extract_charges_from_pdf(file_bytes):
                             desc = match.group("desc").strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
-                            # If the amount ends with a trailing minus, convert it to a normal negative number.
+                            
+                            # Process rate: if rate ends with a trailing minus, remove it and prepend a minus sign.
+                            if rate_val.endswith("−") or rate_val.endswith("-"):
+                                rate_val = rate_val.rstrip("−-")
+                                if not rate_val.startswith("-"):
+                                    rate_val = "-" + rate_val
+                            
+                            # Process amount similarly.
                             if raw_amount.endswith("−") or raw_amount.endswith("-"):
                                 raw_amount = raw_amount.rstrip("−-")
                                 if not raw_amount.startswith("-"):
                                     raw_amount = "-" + raw_amount
-                            amount_str = raw_amount
                             try:
-                                amount = float(amount_str)
+                                amount = float(raw_amount)
                             except ValueError:
                                 continue
                             if any(keyword in desc.lower() for keyword in ["page", "year", "meter", "temp", "date"]):
