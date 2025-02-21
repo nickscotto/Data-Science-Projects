@@ -27,41 +27,27 @@ def standardize_charge_type(charge_type):
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use ---
+# --- Key Helper: Extract Total Use (single line "Total Use NNNN") ---
 def extract_total_use_from_pdf(file_bytes):
-    """
-    Looks for a line with 'Total', then the next line is 'Use', 
-    then returns the last numeric token from the following line.
-    Example lines:
-        <some text>
-        Total
-           Use
-        1ND360376614 Use (kWh) Feb 13 Jan 15 30 4905
-    """
     with pdfplumber.open(file_bytes) as pdf:
         for page in pdf.pages:
             lines = (page.extract_text() or "").splitlines()
-            # Remove blank lines
-            lines = [l.strip() for l in lines if l.strip()]
-
-            for i in range(len(lines) - 2):
-                # Check if this line says 'Total' (case-insensitive) 
-                # and the next line says 'Use'
-                if re.fullmatch(r'(?i)total', lines[i]) and re.fullmatch(r'(?i)use', lines[i+1]):
-                    # The numeric usage should be on the next line (i+2)
-                    tokens = re.findall(r'\d+(?:,\d+)*', lines[i+2])
-                    if tokens:
-                        # Return the last numeric token found, minus commas
-                        return tokens[-1].replace(",", "")
+            for line in lines:
+                # Case-insensitive match for something like "Total Use 4905"
+                # The captured group is the digits after "Total Use"
+                m = re.match(r'(?i)^.*\btotal\W+use\W+(\d+(?:,\d+)*).*$', line.strip())
+                if m:
+                    return m.group(1).replace(",", "")
     return ""
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
-    regex_pattern = (
+    pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
     )
     with pdfplumber.open(file_bytes) as pdf:
+        # Try pages 1 and 2 for charges
         for page_index in [1, 2]:
             if page_index < len(pdf.pages):
                 text = pdf.pages[page_index].extract_text() or ""
@@ -75,7 +61,7 @@ def extract_charges_from_pdf(file_bytes):
                         header_found = True
                         continue
                     if header_found:
-                        match = re.match(regex_pattern, line)
+                        match = re.match(pattern, line)
                         if match:
                             desc = match.group("desc").strip()
                             rate_val = match.group("rate") or ""
@@ -90,12 +76,16 @@ def extract_charges_from_pdf(file_bytes):
                                 raw_amount = raw_amount.rstrip("−-")
                                 if not raw_amount.startswith("-"):
                                     raw_amount = "-" + raw_amount
+                            
                             try:
                                 amount = float(raw_amount)
                             except ValueError:
                                 continue
+                            
+                            # Skip junk lines
                             if any(k in desc.lower() for k in ["page", "year", "meter", "temp", "date"]):
                                 continue
+                            
                             rows.append({
                                 "Charge_Type": desc,
                                 "Rate": rate_val,
@@ -145,7 +135,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
-    # Build user_id from account number
+    # Generate or retrieve User_ID based on Account Number
     account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
@@ -168,7 +158,7 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build output row
+    # Build final output
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
@@ -176,18 +166,16 @@ def process_pdf(file_io):
         "Bill_Hash": bill_hash,
         "Total Use": total_use
     }
-    # Add charges
     for ct in consolidated:
         if consolidated[ct]["Amount"] != 0:
             output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
         if consolidated[ct]["Rate"]:
             output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
-
     return output_row
 
 # --- Sheet Append Function ---
 def append_row_to_sheet(row_dict):
-    metadata_columns = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
+    metadata_cols = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
     current_data = worksheet.get_all_values()
     if current_data:
         headers = current_data[0]
@@ -196,12 +184,13 @@ def append_row_to_sheet(row_dict):
         headers = []
         existing_rows = []
 
-    charge_columns = [col for col in row_dict if col not in metadata_columns]
-    existing_charge_columns = [col for col in headers if col not in metadata_columns]
-    new_charge_columns = [col for col in charge_columns if col not in existing_charge_columns]
-    all_charge_columns = existing_charge_columns + new_charge_columns
-    full_headers = metadata_columns + all_charge_columns
+    charge_cols = [col for col in row_dict if col not in metadata_cols]
+    existing_charge_cols = [col for col in headers if col not in metadata_cols]
+    new_charge_cols = [col for col in charge_cols if col not in existing_charge_cols]
+    all_charge_cols = existing_charge_cols + new_charge_cols
+    full_headers = metadata_cols + all_charge_cols
 
+    # If new columns appear, update headers and existing rows
     if full_headers != headers:
         worksheet.update("A1", [full_headers])
         if existing_rows:
@@ -210,6 +199,7 @@ def append_row_to_sheet(row_dict):
                 padded_row = [str(row_dict_existing.get(h, "")) for h in full_headers]
                 worksheet.update(f"A{i}", [padded_row])
 
+    # Append new row
     row_values = [str(row_dict.get(h, "")) for h in full_headers]
     worksheet.append_row(row_values)
 
