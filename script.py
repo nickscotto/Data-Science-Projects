@@ -67,34 +67,39 @@ def extract_metadata_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
-        
-        # Expanded date patterns
-        date_patterns = [
-            r"\d{1,2}/\d{1,2}/\d{4}",       # 01/01/2024
-            r"\w+ \d{1,2},? \d{4}",         # January 1, 2024 or January 1 2024
-            r"\w+ \d{4}",                   # January 2024
-            r"\d{4}-\d{1,2}-\d{1,2}",       # 2024-01-01
-            r"\d{1,2}-\w+-\d{4}",           # 01-Jan-2024
-        ]
-        date_formats = ["%m/%d/%Y", "%B %d, %Y", "%B %d %Y", "%B %Y", "%Y-%m-%d", "%d-%b-%Y"]
-        
-        for i, line in enumerate(lines):
-            for pattern in date_patterns:
-                match = re.search(pattern, line)
-                if match:
-                    date_str = match.group()
-                    for fmt in date_formats:
+
+        # Extract Bill Issue Date from the line containing "Bill Issue date:"
+        for line in lines:
+            if "Bill Issue date:" in line:
+                date_text = line.split("Bill Issue date:")[-1].strip()
+                date_patterns = [
+                    (r"\d{1,2}/\d{1,2}/\d{4}", "%m/%d/%Y"),
+                    (r"\w+ \d{1,2},? \d{4}", "%B %d, %Y"),
+                    (r"\w+ \d{4}", "%B %Y"),
+                    (r"\d{4}-\d{1,2}-\d{1,2}", "%Y-%m-%d"),
+                    (r"\d{1,2}-\w+-\d{4}", "%d-%b-%Y")
+                ]
+                for pattern, fmt in date_patterns:
+                    match = re.search(pattern, date_text)
+                    if match:
                         try:
-                            parsed_date = datetime.strptime(date_str, fmt)
+                            parsed_date = datetime.strptime(match.group(), fmt)
                             metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
-                            # Look for person's name in subsequent lines
-                            for j in range(i + 1, min(i + 5, len(lines))):
-                                candidate = lines[j].strip()
-                                if candidate:
-                                    metadata["Person"] = candidate
-                                    return metadata
+                            break
                         except ValueError:
                             continue
+                break
+
+        # Extract Person's Name by finding the line above the one containing "Account"
+        for i, line in enumerate(lines):
+            if "Account" in line:
+                j = i - 1
+                while j >= 0 and not lines[j].strip():
+                    j -= 1
+                if j >= 0:
+                    metadata["Person"] = lines[j].strip()
+                break
+
     return metadata
 
 # --- Main PDF Processing Function ---
