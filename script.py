@@ -27,9 +27,10 @@ def standardize_charge_type(charge_type):
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
+    # Updated regex: allow optional trailing minus (either "−" or "-") after the number.
     regex_pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+)(?:-)?\s+per\s+kWh)?"
-        r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?)(?:\s*)$"
+        r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
     )
     with pdfplumber.open(file_bytes) as pdf:
         for page_index in [1, 2]:
@@ -49,7 +50,13 @@ def extract_charges_from_pdf(file_bytes):
                         if match:
                             desc = match.group("desc").strip()
                             rate_val = match.group("rate") or ""
-                            amount_str = match.group("amount").replace(",", "").replace("−", "-")
+                            raw_amount = match.group("amount").replace(",", "")
+                            # If the amount ends with a trailing minus, convert it to a normal negative number.
+                            if raw_amount.endswith("−") or raw_amount.endswith("-"):
+                                raw_amount = raw_amount.rstrip("−-")
+                                if not raw_amount.startswith("-"):
+                                    raw_amount = "-" + raw_amount
+                            amount_str = raw_amount
                             try:
                                 amount = float(amount_str)
                             except ValueError:
