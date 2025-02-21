@@ -27,39 +27,35 @@ def standardize_charge_type(charge_type):
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use ---
+# --- Key Helper: Extract Total Use (Updated) ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         for page in pdf.pages:
-            # Get non-empty lines
-            lines = [l.strip() for l in (page.extract_text() or "").splitlines() if l.strip()]
-            # Look for a block of 13 consecutive lines where:
-            #   lines[i] + " " + lines[i+1] == "Meter Number"
-            #   lines[i+2] + " " + lines[i+3] == "Energy Type"
-            #   lines[i+4] + " " + lines[i+5] == "End Date"
-            #   lines[i+6] + " " + lines[i+7] == "Start Date"
-            #   lines[i+8] + " " + lines[i+9] == "Number Of Days"
-            #   lines[i+10] + " " + lines[i+11] == "Total Use"
-            # And then the next line (lines[i+12]) contains the values.
-            for i in range(len(lines) - 12):
-                if (lines[i] + " " + lines[i+1] == "Meter Number" and
-                    lines[i+2] + " " + lines[i+3] == "Energy Type" and
-                    lines[i+4] + " " + lines[i+5] == "End Date" and
-                    lines[i+6] + " " + lines[i+7] == "Start Date" and
-                    lines[i+8] + " " + lines[i+9] == "Number Of Days" and
-                    lines[i+10] + " " + lines[i+11] == "Total Use"):
-                    # The next line should be the values:
-                    value_tokens = lines[i+12].split()
-                    # Expecting:
-                    # 0: Meter Number
-                    # 1-2: Energy Type
-                    # 3-4: End Date
-                    # 5-6: Start Date
-                    # 7: Number Of Days
-                    # 8: Total Use
-                    if len(value_tokens) >= 9:
-                        return value_tokens[8]
-    return ""
+            text = page.extract_text() or ""
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            for i, line in enumerate(lines):
+                # Look for "Total Use" (case insensitive) in the line
+                if "total use" in line.lower():
+                    # Try to get the next line or the rest of the current line for the value
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1]
+                        # Extract digits from the next line (assuming it’s the value)
+                        value_match = re.search(r'\b(\d+)\b', next_line)
+                        if value_match:
+                            return value_match.group(1)
+                    # If no next line, check if value is on the same line
+                    same_line_match = re.search(r'total\s*use\s*(\d+)', line.lower())
+                    if same_line_match:
+                        return same_line_match.group(1)
+            # Alternative: Look for the table-like structure more flexibly
+            for i in range(len(lines) - 1):
+                if "number of days" in lines[i].lower() and "total use" in lines[i + 1].lower():
+                    # Assume values are in the next line after "Total Use"
+                    if i + 2 < len(lines):
+                        value_match = re.search(r'\b(\d+)\b', lines[i + 2])
+                        if value_match:
+                            return value_match.group(1)
+    return ""  # Return empty string if not found
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
