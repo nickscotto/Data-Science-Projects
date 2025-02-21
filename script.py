@@ -18,7 +18,7 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
-# --- Helper: Standardize Charge Type Names (Updated) ---
+# --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
     # If "First" or "Last" is explicitly mentioned, keep it
@@ -224,6 +224,7 @@ def append_row_to_sheet(row_dict):
 # --- Streamlit App Interface ---
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
+st.write("**Privacy Disclaimer:** By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power. Your information will not be shared publicly or sold. This form is for informational and organizational purposes only and does not constitute legal representation.")
 
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
 
