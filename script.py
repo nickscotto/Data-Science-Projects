@@ -21,32 +21,34 @@ worksheet = spreadsheet.sheet1
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     if "Distribution Charge" in charge_type or "Transmission" in charge_type:
+        # Keep 'First/Last' if present, remove numeric kWh only
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
-        return charge_type
     else:
+        # Remove 'First/Last/Next' and numeric kWh
         charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
-        return charge_type
+    return charge_type
 
 # --- Updated Helper: Extract Total Use ---
 def extract_total_use_from_pdf(file_bytes):
     total_use = ""
     with pdfplumber.open(file_bytes) as pdf:
-        # Combine text from all pages and normalize whitespace.
-        text = " ".join([page.extract_text() or "" for page in pdf.pages])
-        text = re.sub(r'\s+', ' ', text)
-        # Try multiple patterns for robustness.
+        # Combine text from all pages
+        text = " ".join(page.extract_text() or "" for page in pdf.pages)
+        # Normalize whitespace
+        text = re.sub(r"\s+", " ", text)
+
+        # Try multiple patterns for total usage
         patterns = [
-            r"Total Use\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
-            r"Usage\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
-            r"Use\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
-            r"Total Consumption\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
-            r"Consumption\s*\(kWh\).*?(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Total\s*Use[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Usage[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Use[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
+            r"Consumption[^\d]*(\d+(?:,\d+)*(?:\.\d+)?)",
         ]
         for pattern in patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
-                total_use = m.group(1).replace(",", "")
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                total_use = match.group(1).replace(",", "")
                 break
     return total_use
 
@@ -75,12 +77,14 @@ def extract_charges_from_pdf(file_bytes):
                             desc = match.group("desc").strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
-                            
+
+                            # Handle trailing minus in rate
                             if rate_val.endswith("−") or rate_val.endswith("-"):
                                 rate_val = rate_val.rstrip("−-")
                                 if not rate_val.startswith("-"):
                                     rate_val = "-" + rate_val
-                            
+
+                            # Handle trailing minus in amount
                             if raw_amount.endswith("−") or raw_amount.endswith("-"):
                                 raw_amount = raw_amount.rstrip("−-")
                                 if not raw_amount.startswith("-"):
@@ -89,7 +93,8 @@ def extract_charges_from_pdf(file_bytes):
                                 amount = float(raw_amount)
                             except ValueError:
                                 continue
-                            if any(keyword in desc.lower() for keyword in ["page", "year", "meter", "temp", "date"]):
+                            # Filter out lines we don't want
+                            if any(k in desc.lower() for k in ["page", "year", "meter", "temp", "date"]):
                                 continue
                             rows.append({
                                 "Charge_Type": desc,
@@ -103,6 +108,8 @@ def extract_metadata_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
+
+        # Extract Bill Issue Date
         for line in lines:
             match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
             if match:
@@ -110,24 +117,27 @@ def extract_metadata_from_pdf(file_bytes):
                 try:
                     parsed_date = date_parse(date_text, fuzzy=True)
                     metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
-                except Exception:
+                except:
                     pass
                 break
+
+        # Extract Account Number
         for line in lines:
             match = re.search(r"Account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
             if match:
-                account_number = match.group(1).strip()
-                metadata["Account_Number"] = account_number
+                metadata["Account_Number"] = match.group(1).strip()
                 break
+
     return metadata
 
+# --- Main PDF Processing Function ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
-    
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
-    
+
+    # Consolidate charges
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -139,7 +149,8 @@ def process_pdf(file_io):
                 consolidated[ct]["Rate"] = rate_val
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
-    
+
+    # Build user_id based on account number
     account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
@@ -151,7 +162,8 @@ def process_pdf(file_io):
             st.session_state.customer_ids[account_number] = user_id
     else:
         user_id = str(uuid.uuid4())
-    
+
+    # Check for existing bill
     existing = worksheet.get_all_records()
     bill_id = None
     for row in existing:
@@ -160,7 +172,8 @@ def process_pdf(file_io):
             break
     if not bill_id:
         bill_id = str(uuid.uuid4())
-    
+
+    # Build output row
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
@@ -168,13 +181,17 @@ def process_pdf(file_io):
         "Bill_Hash": bill_hash,
         "Total Use": total_use
     }
+
+    # Add charges
     for ct in consolidated:
         if consolidated[ct]["Amount"] != 0:
             output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
         if consolidated[ct]["Rate"]:
             output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
+
     return output_row
 
+# --- Sheet Append Function ---
 def append_row_to_sheet(row_dict):
     metadata_columns = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
     current_data = worksheet.get_all_values()
@@ -184,21 +201,28 @@ def append_row_to_sheet(row_dict):
     else:
         headers = []
         existing_rows = []
-    charge_columns = [col for col in row_dict.keys() if col not in metadata_columns]
+
+    # Charge columns
+    charge_columns = [col for col in row_dict if col not in metadata_columns]
     existing_charge_columns = [col for col in headers if col not in metadata_columns]
     new_charge_columns = [col for col in charge_columns if col not in existing_charge_columns]
     all_charge_columns = existing_charge_columns + new_charge_columns
     full_headers = metadata_columns + all_charge_columns
+
+    # Update headers if new columns added
     if full_headers != headers:
         worksheet.update("A1", [full_headers])
         if existing_rows:
             for i, row in enumerate(existing_rows, start=2):
                 row_dict_existing = dict(zip(headers, row))
-                padded_row = [str(row_dict_existing.get(header, "")) for header in full_headers]
+                padded_row = [str(row_dict_existing.get(h, "")) for h in full_headers]
                 worksheet.update(f"A{i}", [padded_row])
-    row_values = [str(row_dict.get(header, "")) for header in full_headers]
+
+    # Append new row
+    row_values = [str(row_dict.get(h, "")) for h in full_headers]
     worksheet.append_row(row_values)
 
+# --- Streamlit App Interface ---
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
 
