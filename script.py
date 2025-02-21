@@ -4,7 +4,7 @@ import re
 import uuid
 import hashlib
 from datetime import datetime
-from dateutil.parser import parse as date_parse  # new import for fuzzy date parsing
+from dateutil.parser import parse as date_parse
 import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
@@ -64,12 +64,12 @@ def extract_charges_from_pdf(file_bytes):
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
-    metadata = {"Bill_Month_Year": "", "Person": ""}
+    metadata = {"Bill_Month_Year": "", "Account_Number": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
 
-        # Use a case-insensitive regex to extract any text after "Bill Issue date:"
+        # Extract Bill Issue Date using a case-insensitive regex
         for line in lines:
             match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
             if match:
@@ -81,14 +81,12 @@ def extract_metadata_from_pdf(file_bytes):
                     pass
                 break
 
-        # Extract Person's Name by taking the non-empty line immediately above the one containing "Account"
-        for i, line in enumerate(lines):
-            if "Account" in line:
-                j = i - 1
-                while j >= 0 and not lines[j].strip():
-                    j -= 1
-                if j >= 0:
-                    metadata["Person"] = lines[j].strip()
+        # Extract Account Number using a case-insensitive regex
+        for line in lines:
+            match = re.search(r"Account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
+            if match:
+                account_number = match.group(1).strip()
+                metadata["Account_Number"] = account_number
                 break
 
     return metadata
@@ -113,15 +111,18 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
     
-    # Normalize person's name for User ID
-    person = metadata.get("Person", "").strip().lower()
+    # Use account number to generate a consistent User_ID
+    account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
-    if person in st.session_state.customer_ids:
-        user_id = st.session_state.customer_ids[person]
+    if account_number:
+        if account_number in st.session_state.customer_ids:
+            user_id = st.session_state.customer_ids[account_number]
+        else:
+            user_id = str(uuid.uuid4())
+            st.session_state.customer_ids[account_number] = user_id
     else:
         user_id = str(uuid.uuid4())
-        st.session_state.customer_ids[person] = user_id
     
     # Check for existing bill and assign Bill_ID
     existing = worksheet.get_all_records()
