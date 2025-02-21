@@ -32,16 +32,16 @@ def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            # Join lines to avoid issues with newlines splitting "Total" and "Use"
-            text_no_newlines = " ".join(text.splitlines())
-            if "Total Use" in text_no_newlines:
-                # Get everything after "Total Use"
-                after = text_no_newlines.split("Total Use", 1)[1].strip()
-                # Find all sequences of digits
-                digit_tokens = re.findall(r'\d+', after)
-                # Return the 6th set of digits (index 5) if it exists
-                if len(digit_tokens) >= 6:
-                    return digit_tokens[5]
+            # Normalize whitespace to a single space.
+            normalized_text = " ".join(text.split())
+            # Pattern: fixed headings followed by values:
+            # Meter Number, Energy Type, End Date, Start Date, Number Of Days, Total Use
+            pattern = (r"Meter Number\s+Energy Type\s+End Date\s+Start Date\s+Number Of Days\s+Total Use\s+"
+                       r"(\S+)\s+(\S+\s+\(kWh\))\s+(\S+\s+\d+)\s+(\S+\s+\d+)\s+(\d+)\s+(\d+)")
+            match = re.search(pattern, normalized_text)
+            if match:
+                # Return the 6th captured group: Total Use
+                return match.group(6)
     return ""
 
 # --- PDF Extraction Functions ---
