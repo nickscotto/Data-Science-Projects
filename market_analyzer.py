@@ -1,7 +1,6 @@
 import os
 import streamlit as st
 import pandas as pd
-import yaml
 from langchain_community.vectorstores import Chroma
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -13,13 +12,14 @@ import plotly.express as px
 
 # Streamlit Config
 st.set_page_config(page_title="Steve Li Flow", layout="wide")
-st.title("Steve Li Flow: Podcast Competitor Analyzer")
+st.title("Podcast Competitor Analyzer")
 
-# Load API Key
+# Load API Keys from Streamlit Secrets
 try:
-    OPENAI_API_KEY = yaml.safe_load(open('credentials.yml'))['openai']
-except (FileNotFoundError, KeyError):
-    st.error("Please ensure 'credentials.yml' exists with a valid 'openai' key.")
+    YOUTUBE_API_KEY = st.secrets["youtube"]
+    OPENAI_API_KEY = st.secrets["openai"]
+except KeyError:
+    st.error("API keys for YouTube and OpenAI are missing in Streamlit secrets. Please configure them in your secrets.toml or Streamlit Cloud settings.")
     st.stop()
 
 # Load Metadata
