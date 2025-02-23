@@ -3,3 +3,12 @@ pdfplumber
 pandas
 gspread
 google-auth
+streamlit>=1.30.0
+pandas>=2.0.0
+pyyaml>=6.0.0
+langchain-community>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+openai>=1.30.0
+chromadb>=0.5.0
+plotly-express>=5.0.0
