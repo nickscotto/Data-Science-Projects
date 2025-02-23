@@ -22,12 +22,20 @@ except KeyError:
     st.error("API keys for YouTube and OpenAI are missing in Streamlit secrets. Please configure them in your secrets.toml or Streamlit Cloud settings.")
     st.stop()
 
-# Load Metadata
-if os.path.exists('competitor_podcast_videos.csv'):
-    df = pd.read_csv('competitor_podcast_videos.csv')
-else:
-    st.error("Run the data collection script first to generate 'competitor_podcast_videos.csv'.")
-    st.stop()
+# Load Metadata with Caching and Robust Error Handling
+@st.cache_data
+def load_csv():
+    try:
+        if os.path.exists('competitor_podcast_videos.csv'):
+            return pd.read_csv('competitor_podcast_videos.csv')
+        else:
+            st.error("The CSV file 'competitor_podcast_videos.csv' is missing. Please ensure it’s in the repo root or update the path.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Error loading CSV: {e}. Check the file format or ensure it’s accessible in the repo.")
+        st.stop()
+
+df = load_csv()
 
 # Competitors List with Creator Mapping
 COMPETITORS = {
@@ -41,20 +49,28 @@ COMPETITORS = {
 }
 COMPETITOR_NAMES = list(COMPETITORS.values())
 
-# Vector Store Setup
+# Vector Store Setup with Error Handling
 embedding_function = OpenAIEmbeddings(model='text-embedding-ada-002', api_key=OPENAI_API_KEY)
-vectorstore = Chroma(persist_directory="data/podcast_chroma.db", embedding_function=embedding_function)
-if not os.path.exists("data/podcast_chroma.db"):
-    st.error("Vector store not found. Run the data collection script.")
+try:
+    vectorstore = Chroma(persist_directory="data/podcast_chroma.db", embedding_function=embedding_function)
+    if not os.path.exists("data/podcast_chroma.db"):
+        st.error("Vector store 'data/podcast_chroma.db' not found. Run the data collection script or ensure it’s in the repo under 'data/'.")
+        st.stop()
+except Exception as e:
+    st.error(f"Error loading vector store: {e}. Check the 'data/podcast_chroma.db' file and permissions.")
     st.stop()
 
 # Generate Database Summary
+@st.cache_data
 def generate_db_summary(df, vectorstore):
     podcast_counts = df['podcast_name'].value_counts().to_dict()
     metadata_fields = list(df.columns)
     total_episodes = len(df)
-    sample_docs = vectorstore.similarity_search("common topics", k=5)
-    sample_text = " ".join([doc.page_content[:200] for doc in sample_docs])
+    try:
+        sample_docs = vectorstore.similarity_search("common topics", k=5)
+        sample_text = " ".join([doc.page_content[:200] for doc in sample_docs])
+    except Exception as e:
+        sample_text = "Unable to generate transcript sample due to: " + str(e)
     summary = (
         f"Database Overview:\n"
         f"- Podcasts: {', '.join(COMPETITOR_NAMES)}\n"
