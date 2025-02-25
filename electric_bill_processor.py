@@ -18,7 +18,7 @@ spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
 # --- OpenAI Setup ---
-openai.api_key = st.secrets["openai"]
+client = openai.OpenAI(api_key=st.secrets["openai"])  # Initialize client with API key
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
@@ -95,21 +95,20 @@ def process_with_openai(section_text):
     {text}
     """
     
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "You are a precise data extraction tool."},
             {"role": "user", "content": prompt.format(text=section_text)}
         ],
         temperature=0.0,
-        response_format={"type": "json_object"}
+        response_format={"type": "json_object"}  # Requires openai>=1.2.0
     )
     
     return json.loads(response.choices[0].message.content)
 
 # --- Main Processing Function ---
 def process_pdf(file_io):
-    # Calculate bill hash from bytes
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     
     # Extract metadata manually
@@ -137,7 +136,6 @@ def process_pdf(file_io):
                     metadata["Total_Use"] = token.replace(",", "")
                     break
 
-    # Reset file_io position after reading for metadata
     file_io.seek(0)
     
     # Extract and process charge sections
@@ -186,7 +184,7 @@ def process_pdf(file_io):
             calc_dict[ct] = []
         calc_dict[ct].append(detail["Calculation"])
     for ct, calcs in calc_dict.items():
-        output_row[f"{ct} Calculations"] = "; ".join(calcs)  # Join with semicolon
+        output_row[f"{ct} Calculations"] = "; ".join(calcs)
     
     return output_row
 
