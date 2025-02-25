@@ -4,8 +4,6 @@ import uuid
 import hashlib
 from dateutil.parser import parse as date_parse
 import pdfplumber
-import pytesseract
-from PIL import Image
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -46,17 +44,11 @@ def standardize_charge_type(charge_type):
     return " ".join(w.capitalize() for w in charge_type.split())  # Fallback
 
 # --- Helper: Extract Text ---
-def extract_text_from_pdf(file_bytes, use_ocr=False):
+def extract_text_from_pdf(file_bytes):
     text = ""
     with pdfplumber.open(file_bytes) as pdf:
         for page in pdf.pages:
-            if use_ocr:
-                # Convert page to image and process with OCR
-                page_image = page.to_image(resolution=300)
-                pil_image = page_image.original  # Get the underlying PIL Image
-                text += pytesseract.image_to_string(pil_image)
-            else:
-                text += page.extract_text(layout=True) or ""
+            text += page.extract_text(layout=True) or ""
     return text
 
 # --- Extraction Functions ---
@@ -126,12 +118,9 @@ def process_pdf(file_io):
     charges = extract_charges(text)
     metadata = extract_metadata(text)
     total_use = extract_total_use(text)
-    
-    if not (charges and metadata["Bill_Month_Year"] and total_use):
-        text = extract_text_from_pdf(file_io, use_ocr=True)
-        charges = charges or extract_charges(text)
-        metadata = metadata if metadata["Bill_Month_Year"] else extract_metadata(text)
-        total_use = total_use or extract_total_use(text)
+
+    if not charges or not metadata["Bill_Month_Year"] or not total_use:
+        st.warning("Some data couldn't be extracted. The PDF might be scanned or unusually formatted.")
 
     # Consolidate charges
     consolidated = {}
