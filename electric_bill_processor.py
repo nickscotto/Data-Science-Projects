@@ -18,7 +18,7 @@ spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
 # --- OpenAI Setup ---
-openai.api_key = st.secrets["openai"]  # Access your key from secrets.toml
+openai.api_key = st.secrets["openai"]
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
@@ -49,9 +49,9 @@ def standardize_charge_type(charge_type):
     return charge_type.title()
 
 # --- Helper: Extract Text Between Markers ---
-def extract_charge_sections(file_bytes):
+def extract_charge_sections(file_io):
     sections = []
-    with pdfplumber.open(file_bytes) as pdf:
+    with pdfplumber.open(file_io) as pdf:
         full_text = ""
         for page in pdf.pages:
             full_text += page.extract_text(layout=True) or ""
@@ -96,7 +96,7 @@ def process_with_openai(section_text):
     """
     
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",  # Switch to "gpt-4" if preferred
+        model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "You are a precise data extraction tool."},
             {"role": "user", "content": prompt.format(text=section_text)}
@@ -109,12 +109,12 @@ def process_with_openai(section_text):
 
 # --- Main Processing Function ---
 def process_pdf(file_io):
-    file_bytes = file_io.getvalue()
-    bill_hash = hashlib.md5(file_bytes).hexdigest()
+    # Calculate bill hash from bytes
+    bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     
     # Extract metadata manually
     full_text = ""
-    with pdfplumber.open(file_bytes) as pdf:
+    with pdfplumber.open(file_io) as pdf:
         for page in pdf.pages:
             full_text += page.extract_text(layout=True) or ""
     lines = full_text.splitlines()
@@ -137,8 +137,11 @@ def process_pdf(file_io):
                     metadata["Total_Use"] = token.replace(",", "")
                     break
 
+    # Reset file_io position after reading for metadata
+    file_io.seek(0)
+    
     # Extract and process charge sections
-    charge_sections = extract_charge_sections(file_bytes)
+    charge_sections = extract_charge_sections(file_io)
     all_charges = []
     for section in charge_sections:
         llm_result = process_with_openai(section)
@@ -175,9 +178,15 @@ def process_pdf(file_io):
         "Total Use": metadata.get("Total_Use", ""),
         **{f"{ct} Amount": round(amt, 2) for ct, amt in consolidated.items() if amt != 0}
     }
-    # Add calculation details for debugging/display
+    # Add calculations as lists
+    calc_dict = {}
     for detail in charge_details:
-        output_row[f"{detail['Charge_Type']} Calculation"] = detail["Calculation"]
+        ct = detail["Charge_Type"]
+        if ct not in calc_dict:
+            calc_dict[ct] = []
+        calc_dict[ct].append(detail["Calculation"])
+    for ct, calcs in calc_dict.items():
+        output_row[f"{ct} Calculations"] = "; ".join(calcs)  # Join with semicolon
     
     return output_row
 
@@ -218,6 +227,6 @@ if uploaded_file is not None:
             output_row = process_pdf(file_io)
             append_row_to_sheet(output_row)
             st.success("Thank you for your contribution!")
-            st.write("Extracted Data:", output_row)  # Debugging preview
+            st.write("Extracted Data:", output_row)
         except Exception as e:
             st.error(f"An error occurred: {e}")
