@@ -51,8 +51,10 @@ def extract_text_from_pdf(file_bytes, use_ocr=False):
     with pdfplumber.open(file_bytes) as pdf:
         for page in pdf.pages:
             if use_ocr:
-                img = page.to_image(resolution=300)
-                text += pytesseract.image_to_string(Image.frombytes("RGB", img.size, img.tobytes()))
+                # Convert page to image and process with OCR
+                page_image = page.to_image(resolution=300)
+                pil_image = page_image.original  # Get the underlying PIL Image
+                text += pytesseract.image_to_string(pil_image)
             else:
                 text += page.extract_text(layout=True) or ""
     return text
