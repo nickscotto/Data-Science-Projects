@@ -4,6 +4,8 @@ import uuid
 import hashlib
 from dateutil.parser import parse as date_parse
 import pdfplumber
+import openai
+import json
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -15,9 +17,11 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
+# --- OpenAI Setup ---
+openai.api_key = st.secrets["openai"]  # Access your key from secrets.toml
+
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
-    charge_type = charge_type.strip().lower()
     charge_mapping = {
         "distribution charge": "Distribution Charge",
         "transmission": "Transmission Charge",
@@ -38,63 +42,83 @@ def standardize_charge_type(charge_type):
         "franchise tax": "MD Franchise Tax",
         "adjustment": "Adjustment",
     }
+    charge_type = charge_type.lower()
     for key, value in charge_mapping.items():
         if key in charge_type:
             return value
-    return " ".join(w.capitalize() for w in charge_type.split())  # Fallback
+    return charge_type.title()
 
-# --- Helper: Extract Text ---
-def extract_text_from_pdf(file_bytes):
-    text = ""
+# --- Helper: Extract Text Between Markers ---
+def extract_charge_sections(file_bytes):
+    sections = []
+    with pdfplumber.open(file_bytes) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            full_text += page.extract_text(layout=True) or ""
+        
+        lines = full_text.splitlines()
+        start_marker = "Type of charge How we calculate this charge Amount($)"
+        end_markers = [
+            "Total Electric Charges - Residential Heating",
+            "Total Electric Delivery Charges",
+            "Total Electric Supply Charges"
+        ]
+        
+        in_section = False
+        section_text = ""
+        for line in lines:
+            if start_marker in line:
+                in_section = True
+                section_text = ""
+                continue
+            if in_section and any(end_marker in line for end_marker in end_markers):
+                in_section = False
+                if section_text.strip():
+                    sections.append(section_text.strip())
+                continue
+            if in_section:
+                section_text += line + "\n"
+    
+    return sections
+
+# --- OpenAI Processing ---
+def process_with_openai(section_text):
+    prompt = """
+    You are an expert at extracting data from utility bill tables. Given the following text from a PDF bill charge section (between 'Type of charge How we calculate this charge Amount($)' and a 'Total' line), extract all rows as a structured table. Each row has three columns:
+    - "Charge_Type": The name of the charge (e.g., "Customer Charge", "Distribution Charge First 500 kWh")
+    - "Calculation": The calculation description (e.g., "12032 kWh X $0.0000950 per kWh")
+    - "Amount": The dollar amount (e.g., 1.14, as a float)
+
+    Return the result as a JSON object with a "Charges" key containing a list of dictionaries with "Charge_Type", "Calculation", and "Amount" keys. Do not include the total lines.
+
+    Here’s the text:
+    {text}
+    """
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",  # Switch to "gpt-4" if preferred
+        messages=[
+            {"role": "system", "content": "You are a precise data extraction tool."},
+            {"role": "user", "content": prompt.format(text=section_text)}
+        ],
+        temperature=0.0,
+        response_format={"type": "json_object"}
+    )
+    
+    return json.loads(response.choices[0].message.content)
+
+# --- Main Processing Function ---
+def process_pdf(file_io):
+    file_bytes = file_io.getvalue()
+    bill_hash = hashlib.md5(file_bytes).hexdigest()
+    
+    # Extract metadata manually
+    full_text = ""
     with pdfplumber.open(file_bytes) as pdf:
         for page in pdf.pages:
-            text += page.extract_text(layout=True) or ""
-    return text
-
-# --- Extraction Functions ---
-def extract_total_use(text):
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if "total use" in line.lower() or "electricity you used" in line.lower():
-            for j in range(i, min(i + 5, len(lines))):
-                tokens = lines[j].split()
-                for token in tokens:
-                    if token.replace(",", "").isdigit():
-                        return token.replace(",", "")
-    return ""
-
-def extract_charges(text):
-    rows = []
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    in_charge_section = False
-    
-    for i, line in enumerate(lines):
-        line_lower = line.lower()
-        if any(x in line_lower for x in ["type of charge", "how we calculate", "delivery charges", "supply charges"]):
-            in_charge_section = True
-            continue
-        if in_charge_section and any(x in line_lower for x in ["total electric", "your monthly", "deferred payment"]):
-            in_charge_section = False
-            break
-        if in_charge_section:
-            tokens = line.rsplit("$", 1)
-            if len(tokens) == 2:
-                desc, amount_str = tokens[0].strip(), tokens[1].strip()
-                amount_str = amount_str.replace(",", "").replace("−", "-")
-                try:
-                    amount = float(amount_str)
-                    if not any(x in desc.lower() for x in ["total", "meter", "page", "temp", "service number"]):
-                        # Remove rate/kWh calculation text
-                        desc = " ".join([w for w in desc.split() if not (w.startswith("$") or "kwh" in w.lower() or "kw" in w.lower())])
-                        rows.append({"Charge_Type": desc, "Amount": amount})
-                except ValueError:
-                    continue
-    return rows
-
-def extract_metadata(text):
-    metadata = {"Bill_Month_Year": "", "Account_Number": ""}
-    lines = text.splitlines()
-    
+            full_text += page.extract_text(layout=True) or ""
+    lines = full_text.splitlines()
+    metadata = {"Bill_Month_Year": "", "Account_Number": "", "Total_Use": ""}
     for line in lines:
         line_lower = line.lower()
         if "bill issue date" in line_lower:
@@ -107,27 +131,28 @@ def extract_metadata(text):
         if "account number" in line_lower:
             acc_part = line.split(":", 1)[1].strip() if ":" in line else line.split()[-1]
             metadata["Account_Number"] = "".join(filter(str.isdigit, acc_part))
-    return metadata
+        if "total use" in line_lower or "electricity you used" in line_lower:
+            for token in line.split():
+                if token.replace(",", "").isdigit():
+                    metadata["Total_Use"] = token.replace(",", "")
+                    break
 
-# --- Main Processing Function ---
-def process_pdf(file_io):
-    file_bytes = file_io.getvalue()
-    bill_hash = hashlib.md5(file_bytes).hexdigest()
-    
-    text = extract_text_from_pdf(file_io)
-    charges = extract_charges(text)
-    metadata = extract_metadata(text)
-    total_use = extract_total_use(text)
+    # Extract and process charge sections
+    charge_sections = extract_charge_sections(file_bytes)
+    all_charges = []
+    for section in charge_sections:
+        llm_result = process_with_openai(section)
+        all_charges.extend(llm_result["Charges"])
 
-    if not charges or not metadata["Bill_Month_Year"] or not total_use:
-        st.warning("Some data couldn't be extracted. The PDF might be scanned or unusually formatted.")
-
-    # Consolidate charges
+    # Consolidate charges (only for Amount, keep Calculation separate)
     consolidated = {}
-    for c in charges:
+    charge_details = []
+    for c in all_charges:
         ct = standardize_charge_type(c["Charge_Type"])
-        amt = c["Amount"]
+        amt = float(c["Amount"])
+        calc = c["Calculation"]
         consolidated[ct] = consolidated.get(ct, 0) + amt
+        charge_details.append({"Charge_Type": ct, "Calculation": calc, "Amount": amt})
 
     # Generate User ID
     account_number = metadata.get("Account_Number", "")
@@ -147,9 +172,13 @@ def process_pdf(file_io):
         "Bill_ID": bill_id,
         "Bill_Month_Year": metadata.get("Bill_Month_Year", ""),
         "Bill_Hash": bill_hash,
-        "Total Use": total_use,
+        "Total Use": metadata.get("Total_Use", ""),
         **{f"{ct} Amount": round(amt, 2) for ct, amt in consolidated.items() if amt != 0}
     }
+    # Add calculation details for debugging/display
+    for detail in charge_details:
+        output_row[f"{detail['Charge_Type']} Calculation"] = detail["Calculation"]
+    
     return output_row
 
 # --- Sheet Append Function ---
