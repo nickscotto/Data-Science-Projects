@@ -1,229 +1,268 @@
-import os
 import streamlit as st
-import pandas as pd
-from langchain_community.vectorstores import Chroma
-from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-import plotly.express as px
+import io
+import re
+import uuid
+import hashlib
+from datetime import datetime
+from dateutil.parser import parse as date_parse
+import pdfplumber
+import gspread
+from google.oauth2.service_account import Credentials
 
-# Streamlit Config
-st.set_page_config(page_title="Steve Li Flow", layout="wide")
-st.title("Podcast Competitor Analyzer")
+# --- Google Sheets Setup ---
+scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
+gc = gspread.authorize(creds)
 
-# Load API Keys from Streamlit Secrets
-try:
-    YOUTUBE_API_KEY = st.secrets["youtube"]
-    OPENAI_API_KEY = st.secrets["openai"]
-except KeyError:
-    st.error("API keys for YouTube and OpenAI are missing in Streamlit secrets. Please configure them in your secrets.toml or Streamlit Cloud settings.")
-    st.stop()
+SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+worksheet = spreadsheet.sheet1
 
-# Load Metadata with Caching and Robust Error Handling
-@st.cache_data
-def load_csv():
-    try:
-        if os.path.exists('competitor_podcast_videos.csv'):
-            return pd.read_csv('competitor_podcast_videos.csv')
+# --- Helper: Standardize Charge Type Names ---
+def standardize_charge_type(charge_type):
+    charge_type = charge_type.strip()
+    
+    # Mapping of common charge type variations to standardized names
+    charge_type_mapping = {
+        r"distribution charge.*first": "Distribution Charge First kWh",
+        r"distribution charge.*last": "Distribution Charge Last kWh",
+        r"transmission charge.*first": "Transmission First kWh",
+        r"transmission charge.*last": "Transmission Last kWh",
+        r"customer charge": "Customer Charge",
+        r"low income charge": "Low Income Charge",
+        r"green energy fund": "Green Energy Fund",
+        r"renewable compliance charge": "Renewable Compliance Charge",
+        r"energy efficiency surcharge": "Energy Efficiency Surcharge",
+        r"universal service program": "Universal Service Program",
+        r"md franchise tax": "MD Franchise Tax",
+        r"adjustment": "Adjustment",
+        r"finance charges": "Finance Charges",
+    }
+    
+    # Check for matches in the mapping
+    for pattern, standardized_name in charge_type_mapping.items():
+        if re.search(pattern, charge_type, re.IGNORECASE):
+            return standardized_name
+    
+    # Default to removing "First/Last/Next" and standardizing
+    charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
+    charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+    
+    return charge_type
+
+# --- Key Helper: Extract Total Use (More Robust) ---
+def extract_total_use_from_pdf(file_bytes):
+    with pdfplumber.open(file_bytes) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            
+            # Try to find total use based on common patterns
+            for line in lines:
+                if "total use" in line.lower():
+                    tokens = line.split()
+                    for token in tokens:
+                        if token.isdigit():
+                            return token
+                if "kwh" in line.lower():
+                    tokens = line.split()
+                    for token in tokens:
+                        if token.isdigit():
+                            return token
+    return ""  # Return empty string if not found
+
+# --- PDF Extraction Functions ---
+def extract_charges_from_pdf(file_bytes):
+    rows = []
+    patterns = [
+        r"^(?P<desc>.*?)\s+\$(?P<rate>[\d\.]+(?:[−-])?)\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$",
+        r"^(?P<desc>.*?)\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
+    ]
+    
+    with pdfplumber.open(file_bytes) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = text.splitlines()
+            header_found = False
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Look for headers that indicate the start of the charges table
+                if not header_found and ("type of charge" in line.lower() or "charge description" in line.lower()) and ("amount" in line.lower() or "rate" in line.lower()):
+                    header_found = True
+                    continue
+                
+                if header_found:
+                    for pattern in patterns:
+                        match = re.match(pattern, line)
+                        if match:
+                            desc = match.group("desc").strip()
+                            rate_val = match.group("rate") or ""
+                            raw_amount = match.group("amount").replace(",", "")
+                            
+                            # Handle negative values
+                            if rate_val.endswith(("−", "-")):
+                                rate_val = rate_val.rstrip("−-")
+                                if not rate_val.startswith("-"):
+                                    rate_val = "-" + rate_val
+                            if raw_amount.endswith(("−", "-")):
+                                raw_amount = raw_amount.rstrip("−-")
+                                if not raw_amount.startswith("-"):
+                                    raw_amount = "-" + raw_amount
+                            
+                            try:
+                                amount = float(raw_amount)
+                            except ValueError:
+                                continue
+                            
+                            # Filter out junk lines
+                            if any(k in desc.lower() for k in ["page", "year", "meter", "temp", "date"]):
+                                continue
+                            
+                            rows.append({
+                                "Charge_Type": desc,
+                                "Rate": rate_val,
+                                "Amount": amount
+                            })
+                            break
+    return rows
+
+def extract_metadata_from_pdf(file_bytes):
+    metadata = {"Bill_Month_Year": "", "Account_Number": ""}
+    with pdfplumber.open(file_bytes) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+        lines = text.splitlines()
+        
+        # Extract Bill Month and Year
+        for line in lines:
+            match = re.search(r"bill issue date:\s*(.+)", line, re.IGNORECASE)
+            if match:
+                date_text = match.group(1).strip()
+                try:
+                    parsed_date = date_parse(date_text, fuzzy=True)
+                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
+                except:
+                    pass
+                break
+        
+        # Extract Account Number
+        for line in lines:
+            match = re.search(r"account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
+            if match:
+                metadata["Account_Number"] = match.group(1).strip()
+                break
+    return metadata
+
+# --- Main PDF Processing Function ---
+def process_pdf(file_io):
+    bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
+    charges = extract_charges_from_pdf(file_io)
+    metadata = extract_metadata_from_pdf(file_io)
+    total_use = extract_total_use_from_pdf(file_io)
+
+    # Consolidate charges
+    consolidated = {}
+    for c in charges:
+        ct = standardize_charge_type(c["Charge_Type"])
+        amt = c["Amount"]
+        rate_val = c["Rate"]
+        if ct in consolidated:
+            consolidated[ct]["Amount"] += amt
+            if not consolidated[ct]["Rate"] and rate_val:
+                consolidated[ct]["Rate"] = rate_val
         else:
-            st.error("The CSV file 'competitor_podcast_videos.csv' is missing. Please ensure it’s in the repo root or update the path.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Error loading CSV: {e}. Check the file format or ensure it’s accessible in the repo.")
-        st.stop()
+            consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
-df = load_csv()
-
-# Competitors List with Creator Mapping
-COMPETITORS = {
-    "Russell Brand": "Russell Brand – Stay Free",
-    "Dr. Rangan Chatterjee": "Dr. Rangan Chatterjee – Feel Better, Live More",
-    "Jay Shetty": "Jay Shetty – On Purpose",
-    "Tom Bilyeu": "Tom Bilyeu – Impact Theory",
-    "Lewis Howes": "Lewis Howes – The School of Greatness",
-    "Vishen Lakhiani": "Mindvalley – Vishen Lakhiani",
-    "Steven Bartlett": "Steven Bartlett – Diary of a CEO"
-}
-COMPETITOR_NAMES = list(COMPETITORS.values())
-
-# Vector Store Setup with Error Handling
-embedding_function = OpenAIEmbeddings(model='text-embedding-ada-002', api_key=OPENAI_API_KEY)
-try:
-    vectorstore = Chroma(persist_directory="data/podcast_chroma.db", embedding_function=embedding_function)
-    if not os.path.exists("data/podcast_chroma.db"):
-        st.error("Vector store 'data/podcast_chroma.db' not found. Run the data collection script or ensure it’s in the repo under 'data/'.")
-        st.stop()
-except Exception as e:
-    st.error(f"Error loading vector store: {e}. Check the 'data/podcast_chroma.db' file and permissions.")
-    st.stop()
-
-# Generate Database Summary
-@st.cache_data
-def generate_db_summary(df, vectorstore):
-    podcast_counts = df['podcast_name'].value_counts().to_dict()
-    metadata_fields = list(df.columns)
-    total_episodes = len(df)
-    try:
-        sample_docs = vectorstore.similarity_search("common topics", k=5)
-        sample_text = " ".join([doc.page_content[:200] for doc in sample_docs])
-    except Exception as e:
-        sample_text = "Unable to generate transcript sample due to: " + str(e)
-    summary = (
-        f"Database Overview:\n"
-        f"- Podcasts: {', '.join(COMPETITOR_NAMES)}\n"
-        f"- Episode Counts: {', '.join([f'{name}: {count}' for name, count in podcast_counts.items()])}\n"
-        f"- Metadata Fields: {', '.join(metadata_fields)} (e.g., view_count, like_count, title)\n"
-        f"- Total Episodes: {total_episodes}\n"
-        f"- Transcript Sample: Common topics include {sample_text[:100]}...\n"
-        f"Use metadata for stats (e.g., view_count, top videos) and transcripts for content. "
-        f"Creators map to podcasts: {', '.join([f'{k} → {v}' for k, v in COMPETITORS.items()])}."
-    )
-    return summary
-
-db_summary = generate_db_summary(df, vectorstore)
-
-# Chat History Setup
-msgs = StreamlitChatMessageHistory(key="langchain_messages")
-if "welcome_added" not in st.session_state:
-    st.session_state.welcome_added = False
-if not msgs.messages and not st.session_state.welcome_added:
-    msgs.add_ai_message(f"I have data on these podcasts: {', '.join(COMPETITOR_NAMES)}. Ask me anything!")
-    st.session_state.welcome_added = True
-
-# RAG Chain Setup
-def create_rag_chain():
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=OPENAI_API_KEY, max_tokens=4000)
-
-    contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", "Reformulate the question as a standalone query based on chat history, using creator names (e.g., 'Jay Shetty') to infer the podcast if clear."),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
-
-    qa_system_prompt = (
-        f"{db_summary}\n\n"
-        "You are an assistant analyzing the podcast database. "
-        "For stats questions (e.g., view counts, top videos), use the metadata fields directly. "
-        "For content questions (e.g., topics, strategies), use the transcripts in the context below. "
-        "Answer concisely with examples if possible. "
-        "If data is missing, say 'I don’t have that info' and suggest checking the Dashboard for stats. "
-        "Use chat history and creator associations (e.g., 'Jay Shetty' → 'Jay Shetty – On Purpose') to resolve queries without requiring the full podcast name if the context is clear.\n\n"
-        "{context}"
-    )
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", qa_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-
-    return RunnableWithMessageHistory(
-        rag_chain,
-        lambda session_id: msgs,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-        output_messages_key="answer",
-    )
-
-rag_chain = create_rag_chain()
-
-# Function to Handle Metadata Queries
-def get_top_videos(podcast_name, top_n=5):
-    if podcast_name not in COMPETITOR_NAMES:
-        return f"I don’t have data on {podcast_name}. I only track: {', '.join(COMPETITOR_NAMES)}."
-    filtered_df = df[df['podcast_name'] == podcast_name].sort_values('view_count', ascending=False).head(top_n)
-    if filtered_df.empty:
-        return f"No data found for {podcast_name}."
-    result = f"Top {top_n} videos for {podcast_name}:\n"
-    for i, row in filtered_df.iterrows():
-        result += f"- '{row['title']}' ({row['published_at']}): {row['view_count']} views\n"
-    return result
-
-# UI Layout: Tabs
-tab1, tab2, tab3 = st.tabs(["Dashboard", "Chat Analyzer", "Content Trends"])
-
-# Tab 1: Dashboard
-with tab1:
-    st.subheader("Competitor Stats")
-    podcast_filter = st.multiselect("Select Podcasts", df['podcast_name'].unique(), default=df['podcast_name'].unique())
-    filtered_df = df[df['podcast_name'].isin(podcast_filter)]
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write("Average Engagement")
-        avg_stats = filtered_df.groupby('podcast_name')[['view_count', 'like_count', 'comment_count']].mean().reset_index()
-        st.dataframe(avg_stats.style.format({"view_count": "{:.0f}", "like_count": "{:.0f}", "comment_count": "{:.0f}"}))
-    with col2:
-        st.write("Views Over Time")
-        fig = px.line(filtered_df, x='published_at', y='view_count', color='podcast_name', title="Views by Episode")
-        st.plotly_chart(fig)
-
-# Tab 2: Chat Analyzer
-with tab2:
-    st.subheader("Ask About Your Competitors")
-    
-    # Toggle for showing/hiding history
-    show_history = st.checkbox("Show Conversation History", value=True)
-    
-    # Display history if toggled on
-    if show_history:
-        for msg in msgs.messages:
-            st.chat_message(msg.type).write(msg.content)
+    # Build user_id from account number
+    account_number = metadata.get("Account_Number", "").replace(" ", "")
+    if "customer_ids" not in st.session_state:
+        st.session_state.customer_ids = {}
+    if account_number:
+        if account_number in st.session_state.customer_ids:
+            user_id = st.session_state.customer_ids[account_number]
+        else:
+            user_id = str(uuid.uuid4())
+            st.session_state.customer_ids[account_number] = user_id
     else:
-        st.write("History hidden. Toggle 'Show Conversation History' to view past messages.")
+        user_id = str(uuid.uuid4())
 
-    if question := st.chat_input("E.g., 'Jay Shetty’s top videos' or 'What does Tom Bilyeu talk about?'"):
-        with st.spinner("Analyzing..."):
-            # Add user message to history
-            msgs.add_user_message(question)
-            if show_history:
-                st.chat_message("human").write(question)
+    # Check for existing bill
+    existing = worksheet.get_all_records()
+    bill_id = None
+    for row in existing:
+        if row.get("Bill_Hash") == bill_hash:
+            bill_id = row.get("Bill_ID")
+            break
+    if not bill_id:
+        bill_id = str(uuid.uuid4())
 
-            question_lower = question.lower()
-            stats_keywords = ["view", "views", "count", "counts", "top", "popular", "performance", "videos"]
-            if any(keyword in question_lower for keyword in stats_keywords):
-                # Try to match creator name to podcast
-                podcast_name = None
-                for creator, full_name in COMPETITORS.items():
-                    if creator.lower() in question_lower or full_name.lower().split(" – ")[1] in question_lower:
-                        podcast_name = full_name
-                        break
-                # Use chat history if no match in current query
-                if not podcast_name:
-                    last_podcast = None
-                    for msg in reversed(msgs.messages[-5:]):
-                        if msg.type == "human":
-                            for creator, full_name in COMPETITORS.items():
-                                if creator.lower() in msg.content.lower() or full_name.lower().split(" – ")[1] in msg.content.lower():
-                                    last_podcast = full_name
-                                    break
-                            if last_podcast:
-                                break
-                    podcast_name = last_podcast
-                if podcast_name:
-                    response = get_top_videos(podcast_name)
-                else:
-                    response = "Please specify a podcast or creator name from: " + ", ".join(COMPETITOR_NAMES)
-            else:
-                # Fallback to RAG for content questions
-                response = rag_chain.invoke({"input": question}, config={"configurable": {"session_id": "any"}})
-                response = response['answer']
+    # Build output row
+    output_row = {
+        "User_ID": user_id,
+        "Bill_ID": bill_id,
+        "Bill_Month_Year": metadata.get("Bill_Month_Year", ""),
+        "Bill_Hash": bill_hash,
+        "Total Use": total_use
+    }
+    # Add charges
+    for ct in consolidated:
+        if consolidated[ct]["Amount"] != 0:
+            output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
+        if consolidated[ct]["Rate"]:
+            output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
 
-            # Add AI response to history
-            msgs.add_ai_message(response)
-            if show_history:
-                st.chat_message("ai").write(response)
+    return output_row
 
-# Tab 3: Content Trends
-with tab3:
-    st.subheader("Trending Topics")
-    topic_query = "Summarize the most common topics across all podcasts in the dataset."
-    if st.button("Generate Topic Summary"):
-        with st.spinner("Extracting trends..."):
-            response = rag_chain.invoke({"input": topic_query}, config={"configurable": {"session_id": "any"}})
-            st.write(response['answer'])
+# --- Sheet Append Function ---
+def append_row_to_sheet(row_dict):
+    meta_cols = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
+    current_data = worksheet.get_all_values()
+    if current_data:
+        headers = current_data[0]
+        existing_rows = current_data[1:]
+    else:
+        headers = []
+        existing_rows = []
+
+    charge_cols = [col for col in row_dict if col not in meta_cols]
+    existing_charge_cols = [col for col in headers if col not in meta_cols]
+    new_charge_cols = [col for col in charge_cols if col not in existing_charge_cols]
+    all_charge_cols = existing_charge_cols + new_charge_cols
+    full_headers = meta_cols + all_charge_cols
+
+    if full_headers != headers:
+        worksheet.update("A1", [full_headers])
+        if existing_rows:
+            for i, row in enumerate(existing_rows, start=2):
+                row_dict_existing = dict(zip(headers, row))
+                padded_row = [str(row_dict_existing.get(h, "")) for h in full_headers]
+                worksheet.update(f"A{i}", [padded_row])
+
+    row_values = [str(row_dict.get(h, "")) for h in full_headers]
+    worksheet.append_row(row_values)
+
+# --- Streamlit App Interface ---
+st.title("Delmarva BillWatch")
+st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
+st.write("**Privacy Disclaimer:** By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power. Your information will not be shared publicly or sold. This form is for informational and organizational purposes only and does not constitute legal representation.")
+
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=False)
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.read()
+    file_io = io.BytesIO(file_bytes)
+    bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
+    existing = worksheet.get_all_records()
+    duplicate = any(r.get("Bill_Hash") == bill_hash for r in existing)
+    if duplicate:
+        st.warning("This bill has already been uploaded. Duplicate not added.")
+    else:
+        try:
+            output_row = process_pdf(file_io)
+            append_row_to_sheet(output_row)
+            st.success("Thank you for your contribution!")
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
