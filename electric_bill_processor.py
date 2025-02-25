@@ -21,86 +21,89 @@ worksheet = spreadsheet.sheet1
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
-    # If "First" or "Last" is explicitly mentioned, keep it
-    if "First" in charge_type:
-        charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
-        return "Distribution Charge First kWh" if "Distribution" in charge_type else "Transmission First kWh" if "Transmission" in charge_type else charge_type
-    elif "Last" in charge_type:
-        charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
-        return "Distribution Charge Last kWh" if "Distribution" in charge_type else "Transmission Last kWh" if "Transmission" in charge_type else charge_type
-    # If neither "First" nor "Last" is present, default to "First kWh"
-    elif "Distribution Charge" in charge_type:
-        return "Distribution Charge First kWh"
-    elif "Transmission" in charge_type:
-        return "Transmission First kWh"
-    # For other charges, remove "First/Last/Next" and standardize
-    else:
-        charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
-        charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+    
+    # Mapping of common charge type variations to standardized names
+    charge_type_mapping = {
+        r"distribution charge.*first": "Distribution Charge First kWh",
+        r"distribution charge.*last": "Distribution Charge Last kWh",
+        r"transmission charge.*first": "Transmission First kWh",
+        r"transmission charge.*last": "Transmission Last kWh",
+        r"customer charge": "Customer Charge",
+        r"low income charge": "Low Income Charge",
+        r"green energy fund": "Green Energy Fund",
+        r"renewable compliance charge": "Renewable Compliance Charge",
+        r"energy efficiency surcharge": "Energy Efficiency Surcharge",
+        r"universal service program": "Universal Service Program",
+        r"md franchise tax": "MD Franchise Tax",
+        r"adjustment": "Adjustment",
+        r"finance charges": "Finance Charges",
+    }
+    
+    # Check for matches in the mapping
+    for pattern, standardized_name in charge_type_mapping.items():
+        if re.search(pattern, charge_type, re.IGNORECASE):
+            return standardized_name
+    
+    # Default to removing "First/Last/Next" and standardizing
+    charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
+    charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+    
     return charge_type
 
 # --- Key Helper: Extract Total Use (More Robust) ---
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
-        if len(pdf.pages) < 2:
-            return ""  # Return empty if page 2 doesn’t exist
-        page = pdf.pages[1]  # Page 2 (index 1)
-        text = page.extract_text() or ""
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        
-        # Try header-based extraction
-        for i, line in enumerate(lines):
-            # Flexible header check: look for key phrases
-            if "meter energy" in line.lower() and "number total" in line.lower():
-                if i + 1 < len(lines) and "number type" in lines[i + 1].lower() and "days use" in lines[i + 1].lower():
-                    if i + 2 < len(lines):
-                        # Extract tokens from data line
-                        tokens = lines[i + 2].split()
-                        # Find the last numeric token before non-numeric text
-                        for j in range(len(tokens) - 1, -1, -1):
-                            if tokens[j].isdigit():
-                                return tokens[j]
-        
-        # Fallback: look for a data row with "1ND..." and "kWh"
-        for line in lines:
-            tokens = line.split()
-            if (len(tokens) >= 6 and 
-                tokens[0].startswith("1ND") and 
-                "kWh" in " ".join(tokens)):
-                # Find the last numeric token
-                for j in range(len(tokens) - 1, -1, -1):
-                    if tokens[j].isdigit():
-                        return tokens[j]
-        
-        return ""  # Return empty string if not found
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            
+            # Try to find total use based on common patterns
+            for line in lines:
+                if "total use" in line.lower():
+                    tokens = line.split()
+                    for token in tokens:
+                        if token.isdigit():
+                            return token
+                if "kwh" in line.lower():
+                    tokens = line.split()
+                    for token in tokens:
+                        if token.isdigit():
+                            return token
+    return ""  # Return empty string if not found
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
-    pattern = (
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
-    )
+    patterns = [
+        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$",
+        r"^(?P<desc>.*?)\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
+    ]
+    
     with pdfplumber.open(file_bytes) as pdf:
-        for page_index in [1, 2]:
-            if page_index < len(pdf.pages):
-                text = pdf.pages[page_index].extract_text() or ""
-                lines = text.splitlines()
-                header_found = False
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if not header_found and "Type of charge" in line and "Amount($" in line:
-                        header_found = True
-                        continue
-                    if header_found:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = text.splitlines()
+            header_found = False
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Look for headers that indicate the start of the charges table
+                if not header_found and ("type of charge" in line.lower() or "charge description" in line.lower()) and ("amount" in line.lower() or "rate" in line.lower()):
+                    header_found = True
+                    continue
+                
+                if header_found:
+                    for pattern in patterns:
                         match = re.match(pattern, line)
                         if match:
                             desc = match.group("desc").strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
                             
-                            # Fix trailing minus signs
+                            # Handle negative values
                             if rate_val.endswith(("−", "-")):
                                 rate_val = rate_val.rstrip("−-")
                                 if not rate_val.startswith("-"):
@@ -124,6 +127,7 @@ def extract_charges_from_pdf(file_bytes):
                                 "Rate": rate_val,
                                 "Amount": amount
                             })
+                            break
     return rows
 
 def extract_metadata_from_pdf(file_bytes):
@@ -131,8 +135,10 @@ def extract_metadata_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
         lines = text.splitlines()
+        
+        # Extract Bill Month and Year
         for line in lines:
-            match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
+            match = re.search(r"bill issue date:\s*(.+)", line, re.IGNORECASE)
             if match:
                 date_text = match.group(1).strip()
                 try:
@@ -141,8 +147,10 @@ def extract_metadata_from_pdf(file_bytes):
                 except:
                     pass
                 break
+        
+        # Extract Account Number
         for line in lines:
-            match = re.search(r"Account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
+            match = re.search(r"account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
             if match:
                 metadata["Account_Number"] = match.group(1).strip()
                 break
