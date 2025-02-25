@@ -75,7 +75,7 @@ def extract_total_use_from_pdf(file_bytes):
 def extract_charges_from_pdf(file_bytes):
     rows = []
     patterns = [
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh)?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$",
+        r"^(?P<desc>.*?)\s+\$(?P<rate>[\d\.]+(?:[−-])?)\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$",
         r"^(?P<desc>.*?)\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
     ]
     
@@ -260,6 +260,9 @@ if uploaded_file is not None:
     if duplicate:
         st.warning("This bill has already been uploaded. Duplicate not added.")
     else:
-        output_row = process_pdf(file_io)
-        append_row_to_sheet(output_row)
-        st.success("Thank you for your contribution!")
+        try:
+            output_row = process_pdf(file_io)
+            append_row_to_sheet(output_row)
+            st.success("Thank you for your contribution!")
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
