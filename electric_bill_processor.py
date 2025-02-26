@@ -21,11 +21,12 @@ worksheet = spreadsheet.sheet1
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
+    # If "First" or "Last" is explicitly mentioned, keep it
     if "First" in charge_type:
-        charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+        charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
         return "Distribution Charge First kWh" if "Distribution" in charge_type else "Transmission First kWh" if "Transmission" in charge_type else charge_type
     elif "Last" in charge_type:
-        charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+        charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
         return "Distribution Charge Last kWh" if "Distribution" in charge_type else "Transmission Last kWh" if "Transmission" in charge_type else charge_type
     elif "Distribution Charge" in charge_type:
         return "Distribution Charge First kWh"
@@ -33,7 +34,7 @@ def standardize_charge_type(charge_type):
         return "Transmission First kWh"
     else:
         charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
-        charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
+        charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
     return charge_type
 
 # --- Key Helper: Extract Total Use (More Robust) ---
@@ -45,6 +46,7 @@ def extract_total_use_from_pdf(file_bytes):
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         
+        # Try header-based extraction
         for i, line in enumerate(lines):
             if "meter energy" in line.lower() and "number total" in line.lower():
                 if i + 1 < len(lines) and "number type" in lines[i + 1].lower() and "days use" in lines[i + 1].lower():
@@ -53,6 +55,7 @@ def extract_total_use_from_pdf(file_bytes):
                         for j in range(len(tokens) - 1, -1, -1):
                             if tokens[j].isdigit():
                                 return tokens[j]
+        # Fallback: look for a data row with "1ND..." and "kWh"
         for line in lines:
             tokens = line.split()
             if (len(tokens) >= 6 and 
@@ -66,11 +69,9 @@ def extract_total_use_from_pdf(file_bytes):
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
-    # Modified regex: description group avoids capturing numeric kWh tokens.
+    # The regex now accepts either kWh or kW in the rate portion.
     pattern = (
-        r"^(?P<desc>(?:(?!\b\d+\s*kWh\b).)+?)"  # description without numeric kWh tokens
-        r"(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh))?"  # optional rate part
-        r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"  # amount
+        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+k(?:Wh|W)))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
     )
     with pdfplumber.open(file_bytes) as pdf:
         for page_index in [1, 2]:
@@ -88,10 +89,13 @@ def extract_charges_from_pdf(file_bytes):
                     if header_found:
                         match = re.match(pattern, line)
                         if match:
+                            # Capture and post-process the description to remove numeric tokens and unit words.
                             desc = match.group("desc").strip()
+                            desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', desc).strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
                             
+                            # Fix trailing minus signs if any
                             if rate_val.endswith(("−", "-")):
                                 rate_val = rate_val.rstrip("−-")
                                 if not rate_val.startswith("-"):
@@ -106,6 +110,7 @@ def extract_charges_from_pdf(file_bytes):
                             except ValueError:
                                 continue
                             
+                            # Filter out unwanted lines containing common header/footer tokens.
                             if any(k in desc.lower() for k in ["page", "year", "meter", "temp", "date"]):
                                 continue
                             
@@ -145,7 +150,7 @@ def process_pdf(file_io):
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
 
-    # Consolidate charges
+    # Consolidate charges by standardizing their type
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -158,7 +163,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
-    # Build user_id from account number
+    # Build user_id from account number (stored in session state)
     account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
@@ -171,7 +176,7 @@ def process_pdf(file_io):
     else:
         user_id = str(uuid.uuid4())
 
-    # Check for existing bill
+    # Check for existing bill in the sheet
     existing = worksheet.get_all_records()
     bill_id = None
     for row in existing:
@@ -181,7 +186,7 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build output row
+    # Build output row: merge metadata with consolidated charges
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
