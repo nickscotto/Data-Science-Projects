@@ -21,19 +21,16 @@ worksheet = spreadsheet.sheet1
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
-    # If "First" or "Last" is explicitly mentioned, keep it
     if "First" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
         return "Distribution Charge First kWh" if "Distribution" in charge_type else "Transmission First kWh" if "Transmission" in charge_type else charge_type
     elif "Last" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
         return "Distribution Charge Last kWh" if "Distribution" in charge_type else "Transmission Last kWh" if "Transmission" in charge_type else charge_type
-    # If neither "First" nor "Last" is present, default to "First kWh"
     elif "Distribution Charge" in charge_type:
         return "Distribution Charge First kWh"
     elif "Transmission" in charge_type:
         return "Transmission First kWh"
-    # For other charges, remove "First/Last/Next" and standardize
     else:
         charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
         charge_type = re.sub(r'\s*\d+\s*kWh', ' kWh', charge_type).strip()
@@ -43,42 +40,37 @@ def standardize_charge_type(charge_type):
 def extract_total_use_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         if len(pdf.pages) < 2:
-            return ""  # Return empty if page 2 doesn’t exist
-        page = pdf.pages[1]  # Page 2 (index 1)
+            return ""
+        page = pdf.pages[1]
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         
-        # Try header-based extraction
         for i, line in enumerate(lines):
-            # Flexible header check: look for key phrases
             if "meter energy" in line.lower() and "number total" in line.lower():
                 if i + 1 < len(lines) and "number type" in lines[i + 1].lower() and "days use" in lines[i + 1].lower():
                     if i + 2 < len(lines):
-                        # Extract tokens from data line
                         tokens = lines[i + 2].split()
-                        # Find the last numeric token before non-numeric text
                         for j in range(len(tokens) - 1, -1, -1):
                             if tokens[j].isdigit():
                                 return tokens[j]
-        
-        # Fallback: look for a data row with "1ND..." and "kWh"
         for line in lines:
             tokens = line.split()
             if (len(tokens) >= 6 and 
                 tokens[0].startswith("1ND") and 
                 "kWh" in " ".join(tokens)):
-                # Find the last numeric token
                 for j in range(len(tokens) - 1, -1, -1):
                     if tokens[j].isdigit():
                         return tokens[j]
-        
-        return ""  # Return empty string if not found
+        return ""
 
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
+    # Modified regex: description group avoids capturing numeric kWh tokens.
     pattern = (
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
+        r"^(?P<desc>(?:(?!\b\d+\s*kWh\b).)+?)"  # description without numeric kWh tokens
+        r"(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+kWh))?"  # optional rate part
+        r"\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"  # amount
     )
     with pdfplumber.open(file_bytes) as pdf:
         for page_index in [1, 2]:
@@ -100,7 +92,6 @@ def extract_charges_from_pdf(file_bytes):
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
                             
-                            # Fix trailing minus signs
                             if rate_val.endswith(("−", "-")):
                                 rate_val = rate_val.rstrip("−-")
                                 if not rate_val.startswith("-"):
@@ -115,7 +106,6 @@ def extract_charges_from_pdf(file_bytes):
                             except ValueError:
                                 continue
                             
-                            # Filter out junk lines
                             if any(k in desc.lower() for k in ["page", "year", "meter", "temp", "date"]):
                                 continue
                             
@@ -199,7 +189,6 @@ def process_pdf(file_io):
         "Bill_Hash": bill_hash,
         "Total Use": total_use
     }
-    # Add charges
     for ct in consolidated:
         if consolidated[ct]["Amount"] != 0:
             output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
