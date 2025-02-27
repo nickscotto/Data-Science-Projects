@@ -36,13 +36,34 @@ def extract_table_rows(page, tolerance=5):
         sorted_rows.append(row_text)
     return sorted_rows
 
+# --- Helper: Extract the Amount from a Row ---
+def extract_amount_from_row(row):
+    """
+    First, try to find the numeric value immediately following a "per kWh" or "per kW" phrase.
+    If not found, fall back to scanning the tokens from the right for a valid number.
+    """
+    m = re.search(r'per\s+k(?:Wh|W)\s+(-?[\d,]+(?:\.\d+)?)', row, re.IGNORECASE)
+    if m:
+        raw_amount = m.group(1).replace(",", "")
+        try:
+            return float(raw_amount)
+        except:
+            pass
+    tokens = row.split()
+    for token in reversed(tokens):
+        token_clean = token.strip("$").replace(",", "")
+        try:
+            return float(token_clean)
+        except:
+            continue
+    return None
+
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
     # Unify any charge that contains "Total Electric Charges"
     if "Total Electric Charges" in charge_type:
         return "Total Electric Charges"
-    # For 'First' charges.
     if "First" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
         if "Distribution" in charge_type:
@@ -51,7 +72,6 @@ def standardize_charge_type(charge_type):
             return "Transmission Charge First kWh"
         else:
             return charge_type
-    # For 'Last' charges.
     elif "Last" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
         if "Distribution" in charge_type:
@@ -93,13 +113,13 @@ def extract_total_use_from_pdf(file_bytes):
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
     with pdfplumber.open(file_bytes) as pdf:
-        # Process pages that likely contain the charge table (e.g., pages 1 and 2)
+        # Process pages likely containing the table (e.g., pages 1 and 2)
         for page_index in [1, 2]:
             if page_index < len(pdf.pages):
                 page = pdf.pages[page_index]
                 table_rows = extract_table_rows(page)
                 header_found = False
-                seen_total = False  # Flag to indicate a row with "Total" has been encountered.
+                seen_total = False
                 for row in table_rows:
                     row_lower = row.lower()
                     # Look for header row.
@@ -107,37 +127,34 @@ def extract_charges_from_pdf(file_bytes):
                         header_found = True
                         continue
                     if header_found:
-                        # Check if this row's description starts with "total"
-                        # (after we extract the description, we'll later clean it)
-                        temp_desc = row.strip().split()[0].lower() if row.strip() else ""
-                        is_total_row = temp_desc.startswith("total")
-                        if is_total_row:
+                        # Determine if this row is a total row.
+                        tokens = row.strip().split()
+                        if tokens and tokens[0].lower().startswith("total"):
                             seen_total = True
                         else:
-                            # If we've seen one or more total rows and now encounter a non-total row,
-                            # assume we've reached the bottom of the table.
+                            # If we have seen total rows and now a non-total row appears, assume table ended.
                             if seen_total:
                                 break
-                        # Use regex to capture the row.
-                        pattern = (
-                            r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+k(?:Wh|W)))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
-                        )
-                        match = re.match(pattern, row)
-                        if match:
-                            desc = match.group("desc").strip()
-                            # Clean up description: remove stray numeric tokens (e.g. "11532 kWh").
-                            desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', desc).strip()
-                            rate_val = match.group("rate") or ""
-                            raw_amount = match.group("amount").replace(",", "")
-                            try:
-                                amount = float(raw_amount)
-                            except ValueError:
-                                continue
-                            rows_out.append({
-                                "Charge_Type": desc,
-                                "Rate": rate_val,
-                                "Amount": amount
-                            })
+                        # Extract rate if present.
+                        rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', row)
+                        rate_val = rate_match.group(1) if rate_match else ""
+                        # Extract the amount using our dedicated function.
+                        amount = extract_amount_from_row(row)
+                        if amount is None:
+                            continue
+                        # For description, remove the rate and amount portions.
+                        desc = row
+                        if rate_match:
+                            desc = desc.split(rate_match.group(0))[0].strip()
+                        # Also remove any "per kWh" and what follows.
+                        desc = re.split(r'per\s+k(?:Wh|W)', desc, flags=re.IGNORECASE)[0].strip()
+                        # Remove stray numeric tokens.
+                        desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', desc).strip()
+                        rows_out.append({
+                            "Charge_Type": desc,
+                            "Rate": rate_val,
+                            "Amount": amount
+                        })
     return rows_out
 
 def extract_metadata_from_pdf(file_bytes):
