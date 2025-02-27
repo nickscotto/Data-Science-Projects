@@ -76,7 +76,7 @@ def standardize_charge_type(charge_type):
     return charge_type
 
 # --- Key Helper: Extract Total Use (unchanged) ---
-def extract_total_use_from_pdf(file_io):  # Changed parameter to file_io
+def extract_total_use_from_pdf(file_io):
     with pdfplumber.open(file_io) as pdf:
         if len(pdf.pages) < 2:
             return ""
@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):  # Changed parameter to file_io
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Fix Parsing and Boundaries) ---
+# --- Updated: Extract Charges from PDF (Fix Negatives and Total Doubling) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -167,7 +167,7 @@ def extract_charges_from_pdf(file_io):
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(?:\s*−)?$', line)  # Match currency format
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(−)?$', line)  # Capture trailing −
                         if amount_match:
                             amount_text = amount_match.group(0).replace("−", "-")
                             try:
@@ -199,19 +199,24 @@ def extract_charges_from_pdf(file_io):
                 for line in lines:
                     if "total electric charges" in line.lower():
                         st.write(f"Page {page_num}: Processing final total line: {line}")
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(?:\s*−)?$', line)
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(−)?$', line)
                         if amount_match:
                             amount_text = amount_match.group(0).replace("−", "-")
                             try:
                                 amount = float(amount_text.replace(",", ""))
-                                row_data = {
-                                    "Charge_Type": "Total Electric Charges",
-                                    "Rate": "",
-                                    "Amount": amount
-                                }
-                                rows_out = [r for r in rows_out if r["Charge_Type"] != "Total Electric Charges"]
-                                rows_out.append(row_data)
-                                st.write(f"Page {page_num}: Extracted final total row: {row_data}")
+                                # Check for existing Total Electric Charges and update if variant found
+                                total_exists = next((r for r in rows_out if "total electric charges" in r["Charge_Type"].lower()), None)
+                                if total_exists:
+                                    total_exists["Amount"] = amount  # Update existing entry
+                                    st.write(f"Page {page_num}: Updated existing Total Electric Charges to: {amount}")
+                                else:
+                                    row_data = {
+                                        "Charge_Type": "Total Electric Charges",
+                                        "Rate": "",
+                                        "Amount": amount
+                                    }
+                                    rows_out.append(row_data)
+                                    st.write(f"Page {page_num}: Extracted final total row: {row_data}")
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Failed to parse final total from '{amount_text}' in line: {line}")
 
@@ -248,7 +253,7 @@ def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
-    total_use = extract_total_use_from_pdf(file_io)  # Fixed to use file_io
+    total_use = extract_total_use_from_pdf(file_io)
 
     st.write("Extracted Charges:", charges)
 
