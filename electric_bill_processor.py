@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust Table Detection with Bounding Boxes) ---
+# --- Updated: Extract Charges from PDF (Robust Table Detection without Erroneous BBox) ---
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
     
@@ -127,7 +127,7 @@ def extract_charges_from_pdf(file_bytes):
                         type_idx = headers.index("type of charge")
                         calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
                         amount_idx = headers.index("amount($)")
-                        table_bbox = table.bbox  # (x0, top, x1, bottom) of the table
+                        table_bbox = table.bbox  # (x0, top, x1, bottom) for debug
                         st.write(f"Page {page_num}: Table bounds: {table_bbox}")
 
                         for i, row in enumerate(extracted_table[1:], start=1):
@@ -154,7 +154,7 @@ def extract_charges_from_pdf(file_bytes):
                                 st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                                 continue
 
-            # Fallback: Text-based extraction if no table detected, with spatial context
+            # Fallback: Text-based extraction with better table boundary detection
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
@@ -164,12 +164,6 @@ def extract_charges_from_pdf(file_bytes):
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
                         in_table = True
                         st.write(f"Page {page_num}: Detected table header in text: {line}")
-                        # Estimate table start position (approximate based on header)
-                        header_words = page.extract_words(bbox=(0, page.height / 2, page.width, page.height))
-                        if header_words:
-                            header_y = header_words[0]['top']
-                            table_start_y = header_y - 10  # Buffer above header
-                            st.write(f"Page {page_num}: Estimated table start y: {table_start_y}")
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
@@ -190,7 +184,7 @@ def extract_charges_from_pdf(file_bytes):
                                 }
                                 rows_out.append(row_data)
                                 st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
-                                if "total" in charge_type.lower() and i < len(lines) - 1 and "type of charge" not in lines[i + 1].lower():
+                                if "total" in charge_type.lower() and i < len(lines) - 1 and not any("type of charge" in next_line.lower() for next_line in lines[i+1:] if next_line):
                                     st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
                                     in_table = False
                                 current_charge = ""
@@ -199,10 +193,9 @@ def extract_charges_from_pdf(file_bytes):
                                 continue
                         else:
                             current_charge = current_charge + " " + line if current_charge else line
-                        # Stop if line is outside estimated table bounds (rough heuristic)
-                        words = page.extract_words()
-                        if words and words[-1]['top'] > table_start_y + 200:  # Arbitrary height limit
-                            st.write(f"Page {page_num}: Exceeded table height, ending fallback")
+                        # Stop if no more relevant lines (heuristic based on next lines)
+                        if i < len(lines) - 1 and not any("charge" in next_line.lower() or "total" in next_line.lower() for next_line in lines[i+1:i+5]):
+                            st.write(f"Page {page_num}: No further charge-related lines, ending fallback")
                             in_table = False
 
             # Look for the final "Total Electric Charges" line across all pages
@@ -243,7 +236,7 @@ def extract_metadata_from_pdf(file_bytes):
                 date_text = match.group(1).strip()
                 try:
                     parsed_date = date_parse(date_text, fuzzy=True)
-                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
+                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-Y")
                 except:
                     pass
                 break
