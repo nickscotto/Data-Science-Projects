@@ -99,12 +99,12 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust, Page-Agnostic) ---
+# --- Updated: Extract Charges from PDF (Robust, Page-Agnostic, Debugged) ---
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
     
     with pdfplumber.open(file_bytes) as pdf:
-        for page in pdf.pages:
+        for page_num, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             text_lower = text.lower()
 
@@ -121,6 +121,7 @@ def extract_charges_from_pdf(file_bytes):
             if table and len(table) > 1:
                 headers = [h.lower() if h else "" for h in table[0]]
                 if "type of charge" in headers and "amount($)" in headers:
+                    st.write(f"Page {page_num}: Found table with headers: {headers}")
                     type_idx = headers.index("type of charge")
                     calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
                     amount_idx = headers.index("amount($)")
@@ -130,7 +131,7 @@ def extract_charges_from_pdf(file_bytes):
                             continue
                         charge_type = row[type_idx].strip() if row[type_idx] else ""
                         if "total" in charge_type.lower():
-                            continue  # Skip total rows
+                            continue
                         amount_text = row[amount_idx].strip() if row[amount_idx] else ""
                         calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
                         
@@ -138,27 +139,31 @@ def extract_charges_from_pdf(file_bytes):
                             amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
                             rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
                             rate_val = rate_match.group(1) if rate_match else ""
-                            rows_out.append({
+                            row_data = {
                                 "Charge_Type": charge_type,
                                 "Rate": rate_val,
                                 "Amount": amount
-                            })
+                            }
+                            rows_out.append(row_data)
+                            st.write(f"Page {page_num}: Extracted row: {row_data}")
                         except (ValueError, TypeError):
+                            st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                             continue
             
-            # Fallback: Use text-based extraction if table detection fails
-            if not rows_out or ("delivery charges" in text_lower or "supply charges" in text_lower):
+            # Fallback: Text-based extraction if no table detected or context suggests charges
+            if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
                 for i, line in enumerate(lines):
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
                         in_table = True
+                        st.write(f"Page {page_num}: Detected table header in text: {line}")
                         continue
                     if in_table:
                         if "total" in line.lower():
                             in_table = False
                             continue
-                        tokens = re.split(r'\s{2,}', line)  # Split on multiple spaces
+                        tokens = re.split(r'\s{2,}', line)
                         if len(tokens) >= 2:
                             charge_type = tokens[0].strip()
                             amount_text = tokens[-1].strip()
@@ -167,14 +172,19 @@ def extract_charges_from_pdf(file_bytes):
                                 amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
                                 rate_val = rate_match.group(1) if rate_match else ""
-                                rows_out.append({
+                                row_data = {
                                     "Charge_Type": charge_type,
                                     "Rate": rate_val,
                                     "Amount": amount
-                                })
+                                }
+                                rows_out.append(row_data)
+                                st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
                             except (ValueError, TypeError):
+                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{amount_text}' in line: {line}")
                                 continue
     
+    if not rows_out:
+        st.warning("No charges tables found in the PDF.")
     return rows_out
 
 # --- Extract Metadata from PDF (unchanged) ---
@@ -199,12 +209,15 @@ def extract_metadata_from_pdf(file_bytes):
                 break
     return metadata
 
-# --- Main PDF Processing Function (unchanged) ---
+# --- Main PDF Processing Function (Updated with Debugging) ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
+
+    # Debugging: Display extracted charges
+    st.write("Extracted Charges:", charges)
 
     consolidated = {}
     for c in charges:
@@ -217,6 +230,9 @@ def process_pdf(file_io):
                 consolidated[ct]["Rate"] = rate_val
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
+
+    # Debugging: Display consolidated charges
+    st.write("Consolidated Charges:", consolidated)
 
     account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
@@ -252,6 +268,8 @@ def process_pdf(file_io):
         if consolidated[ct]["Rate"]:
             output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
 
+    # Debugging: Display final output row
+    st.write("Final Output Row:", output_row)
     return output_row
 
 # --- Sheet Append Function (unchanged) ---
@@ -282,7 +300,7 @@ def append_row_to_sheet(row_dict):
     row_values = [str(row_dict.get(h, "")) for h in full_headers]
     worksheet.append_row(row_values)
 
-# --- Streamlit App Interface (unchanged) ---
+# --- Streamlit App Interface (Updated with Debugging) ---
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
 st.write("**Privacy Disclaimer:** By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power. Your information will not be shared publicly or sold. This form is for informational and organizational purposes only and does not constitute legal representation.")
