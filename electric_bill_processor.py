@@ -21,27 +21,25 @@ worksheet = spreadsheet.sheet1
 # --- Helper: Reassemble Table Rows Using Word Clustering ---
 def extract_table_rows(page, tolerance=5):
     """
-    Use pdfplumber's extract_words to group words by their vertical position,
-    thereby attempting to reconstruct the table's rows.
+    Group words by their vertical coordinate (within a tolerance)
+    to reassemble the table rows.
     """
     words = page.extract_words()
     rows = {}
     for word in words:
-        # Use a tolerance to group words on nearly the same horizontal line.
         key = round(word['top'] / tolerance) * tolerance
         rows.setdefault(key, []).append(word)
     sorted_rows = []
     for key in sorted(rows.keys()):
-        # Sort words in a row by their x0 coordinate.
         row_words = sorted(rows[key], key=lambda w: w['x0'])
-        row_text = " ".join(word['text'] for word in row_words)
+        row_text = " ".join(w['text'] for w in row_words)
         sorted_rows.append(row_text)
     return sorted_rows
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
-    # If the description contains "Total Electric Charges" anywhere, unify it.
+    # Unify any charge that contains "Total Electric Charges"
     if "Total Electric Charges" in charge_type:
         return "Total Electric Charges"
     # For 'First' charges.
@@ -91,32 +89,43 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- PDF Extraction: Charges from the Table ---
+# --- PDF Extraction Functions: Charges from the Table ---
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
-    # We will work on pages 1 and 2 (adjust indices as needed)
     with pdfplumber.open(file_bytes) as pdf:
+        # Process pages that likely contain the charge table (e.g., pages 1 and 2)
         for page_index in [1, 2]:
             if page_index < len(pdf.pages):
                 page = pdf.pages[page_index]
                 table_rows = extract_table_rows(page)
-                # Uncomment the next line to inspect the reassembled rows:
-                # st.write("Reconstructed Rows:", table_rows)
                 header_found = False
+                seen_total = False  # Flag to indicate a row with "Total" has been encountered.
                 for row in table_rows:
-                    # Look for header row indicating the table has begun.
-                    if not header_found and "Type of charge" in row and "Amount($" in row:
+                    row_lower = row.lower()
+                    # Look for header row.
+                    if not header_found and "type of charge" in row_lower and "amount($" in row_lower:
                         header_found = True
                         continue
                     if header_found:
-                        # Use a regex that expects the full row text.
+                        # Check if this row's description starts with "total"
+                        # (after we extract the description, we'll later clean it)
+                        temp_desc = row.strip().split()[0].lower() if row.strip() else ""
+                        is_total_row = temp_desc.startswith("total")
+                        if is_total_row:
+                            seen_total = True
+                        else:
+                            # If we've seen one or more total rows and now encounter a non-total row,
+                            # assume we've reached the bottom of the table.
+                            if seen_total:
+                                break
+                        # Use regex to capture the row.
                         pattern = (
                             r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+k(?:Wh|W)))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
                         )
                         match = re.match(pattern, row)
                         if match:
                             desc = match.group("desc").strip()
-                            # Remove any stray numeric tokens (like meter readings) from description.
+                            # Clean up description: remove stray numeric tokens (e.g. "11532 kWh").
                             desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', desc).strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
