@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Improved Text Fallback) ---
+# --- Updated: Extract Charges from PDF (Include All Totals, Stop at Last Total) ---
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
     
@@ -126,12 +126,10 @@ def extract_charges_from_pdf(file_bytes):
                     calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
                     amount_idx = headers.index("amount($)")
                     
-                    for row in table[1:]:
+                    for i, row in enumerate(table[1:]):
                         if len(row) <= max(type_idx, calc_idx, amount_idx):
                             continue
                         charge_type = row[type_idx].strip() if row[type_idx] else ""
-                        if "total" in charge_type.lower():
-                            continue
                         amount_text = row[amount_idx].strip() if row[amount_idx] else ""
                         calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
                         
@@ -146,14 +144,19 @@ def extract_charges_from_pdf(file_bytes):
                             }
                             rows_out.append(row_data)
                             st.write(f"Page {page_num}: Extracted row: {row_data}")
+                            # Check if this is the last "total" row
+                            if "total" in charge_type.lower() and i == len(table[1:]) - 1:
+                                st.write(f"Page {page_num}: Last row is a total, ending table: {charge_type}")
+                                break
                         except (ValueError, TypeError):
                             st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                             continue
             
-            # Enhanced Fallback: Text-based extraction with better row parsing
+            # Enhanced Fallback: Handle multi-line charges, include all totals, stop at last total
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
+                current_charge = ""
                 st.write(f"Page {page_num}: Processing lines for fallback:")
                 for i, line in enumerate(lines):
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
@@ -161,23 +164,17 @@ def extract_charges_from_pdf(file_bytes):
                         st.write(f"Page {page_num}: Detected table header in text: {line}")
                         continue
                     if in_table:
-                        if "total" in line.lower():
-                            in_table = False
-                            st.write(f"Page {page_num}: Stopped at total line: {line}")
-                            continue
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        # Improved parsing: Look for amount at the end and rate in the middle
-                        amount_match = re.search(r'[\d\.,]+[−-]?$', line)
+                        amount_match = re.search(r'(-?[\d\.,]+[−-]?$)', line)
                         if amount_match:
                             amount_text = amount_match.group(0)
                             try:
                                 amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
-                                # Extract rate if present
-                                rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', line)
+                                combined_line = current_charge + " " + line if current_charge else line
+                                rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', combined_line)
                                 rate_val = rate_match.group(1) if rate_match else ""
-                                # Charge type is everything before the rate or amount
-                                charge_type_end = line.find("X $") if rate_val else amount_match.start()
-                                charge_type = line[:charge_type_end].strip() if charge_type_end > 0 else line.strip()
+                                charge_type_end = combined_line.find("X $") if rate_val else amount_match.start()
+                                charge_type = combined_line[:charge_type_end].strip() if charge_type_end > 0 else combined_line.strip()
                                 row_data = {
                                     "Charge_Type": charge_type,
                                     "Rate": rate_val,
@@ -185,9 +182,19 @@ def extract_charges_from_pdf(file_bytes):
                                 }
                                 rows_out.append(row_data)
                                 st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
+                                # Check if this is the last "total" row
+                                if "total" in charge_type.lower() and i < len(lines) - 1 and "type of charge" not in lines[i + 1].lower():
+                                    st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
+                                    in_table = False
+                                current_charge = ""  # Reset after extracting a row
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Fallback failed to parse amount from '{amount_text}' in line: {line}")
                                 continue
+                        elif "charge" in line.lower() or "adjustment" in line.lower() or "service" in line.lower() or "total" in line.lower():
+                            current_charge = current_charge + " " + line if current_charge else line
+                        elif current_charge:
+                            current_charge = current_charge + " " + line  # Continue accumulating if part of multi-line
+
     
     if not rows_out:
         st.warning("No charges tables found in the PDF.")
@@ -224,7 +231,6 @@ def process_pdf(file_io):
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
 
-    # Debugging
     st.write("Extracted Charges:", charges)
 
     consolidated = {}
