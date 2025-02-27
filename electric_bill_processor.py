@@ -18,33 +18,33 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
-# --- Helper: Merge Broken Lines from the PDF Table ---
-def merge_charge_lines(lines):
-    merged = []
-    buffer = ""
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        # Heuristic: if the line does not start with a currency symbol or digit
-        # and the buffer is not empty, then it is likely a continuation of the previous line.
-        if buffer and re.match(r"^[A-Za-z]", line) and not re.search(r'\$\s*\d', line):
-            buffer += " " + line
-        else:
-            if buffer:
-                merged.append(buffer)
-            buffer = line
-    if buffer:
-        merged.append(buffer)
-    return merged
+# --- Helper: Reassemble Table Rows Using Word Clustering ---
+def extract_table_rows(page, tolerance=5):
+    """
+    Use pdfplumber's extract_words to group words by their vertical position,
+    thereby attempting to reconstruct the table's rows.
+    """
+    words = page.extract_words()
+    rows = {}
+    for word in words:
+        # Use a tolerance to group words on nearly the same horizontal line.
+        key = round(word['top'] / tolerance) * tolerance
+        rows.setdefault(key, []).append(word)
+    sorted_rows = []
+    for key in sorted(rows.keys()):
+        # Sort words in a row by their x0 coordinate.
+        row_words = sorted(rows[key], key=lambda w: w['x0'])
+        row_text = " ".join(word['text'] for word in row_words)
+        sorted_rows.append(row_text)
+    return sorted_rows
 
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
-    # Unify columns that have "Total Electric Charges" regardless of the subtext.
+    # If the description contains "Total Electric Charges" anywhere, unify it.
     if "Total Electric Charges" in charge_type:
         return "Total Electric Charges"
-    # For First charges: remove any numeric token and standardize.
+    # For 'First' charges.
     if "First" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
         if "Distribution" in charge_type:
@@ -53,7 +53,7 @@ def standardize_charge_type(charge_type):
             return "Transmission Charge First kWh"
         else:
             return charge_type
-    # For Last charges.
+    # For 'Last' charges.
     elif "Last" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
         if "Distribution" in charge_type:
@@ -62,7 +62,7 @@ def standardize_charge_type(charge_type):
             return "Transmission Charge Last kWh"
         else:
             return charge_type
-    # Otherwise, remove extraneous words and numbers.
+    # Otherwise, remove extra keywords and numbers.
     charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
     charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
     return charge_type
@@ -75,7 +75,6 @@ def extract_total_use_from_pdf(file_bytes):
         page = pdf.pages[1]
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
-        
         for i, line in enumerate(lines):
             if "meter energy" in line.lower() and "number total" in line.lower():
                 if i + 1 < len(lines) and "number type" in lines[i + 1].lower() and "days use" in lines[i + 1].lower():
@@ -86,59 +85,57 @@ def extract_total_use_from_pdf(file_bytes):
                                 return tokens[j]
         for line in lines:
             tokens = line.split()
-            if (len(tokens) >= 6 and 
-                tokens[0].startswith("1ND") and 
-                "kWh" in " ".join(tokens)):
+            if (len(tokens) >= 6 and tokens[0].startswith("1ND") and "kWh" in " ".join(tokens)):
                 for j in range(len(tokens) - 1, -1, -1):
                     if tokens[j].isdigit():
                         return tokens[j]
         return ""
 
-# --- PDF Extraction Functions ---
+# --- PDF Extraction: Charges from the Table ---
 def extract_charges_from_pdf(file_bytes):
-    rows = []
-    # The regex captures: description, an optional rate, and the amount.
-    pattern = (
-        r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+k(?:Wh|W)))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
-    )
+    rows_out = []
+    # We will work on pages 1 and 2 (adjust indices as needed)
     with pdfplumber.open(file_bytes) as pdf:
         for page_index in [1, 2]:
             if page_index < len(pdf.pages):
-                text = pdf.pages[page_index].extract_text() or ""
-                raw_lines = text.splitlines()
-                lines = merge_charge_lines(raw_lines)
+                page = pdf.pages[page_index]
+                table_rows = extract_table_rows(page)
+                # Uncomment the next line to inspect the reassembled rows:
+                # st.write("Reconstructed Rows:", table_rows)
                 header_found = False
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if not header_found and "Type of charge" in line and "Amount($" in line:
+                for row in table_rows:
+                    # Look for header row indicating the table has begun.
+                    if not header_found and "Type of charge" in row and "Amount($" in row:
                         header_found = True
                         continue
                     if header_found:
-                        match = re.match(pattern, line)
+                        # Use a regex that expects the full row text.
+                        pattern = (
+                            r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+k(?:Wh|W)))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
+                        )
+                        match = re.match(pattern, row)
                         if match:
-                            # Remove any embedded numeric tokens (like "11532 kWh") from the description.
-                            desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', match.group("desc").strip()).strip()
+                            desc = match.group("desc").strip()
+                            # Remove any stray numeric tokens (like meter readings) from description.
+                            desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', desc).strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
                             try:
                                 amount = float(raw_amount)
                             except ValueError:
                                 continue
-                            rows.append({
+                            rows_out.append({
                                 "Charge_Type": desc,
                                 "Rate": rate_val,
                                 "Amount": amount
                             })
-    return rows
+    return rows_out
 
 def extract_metadata_from_pdf(file_bytes):
     metadata = {"Bill_Month_Year": "", "Account_Number": ""}
     with pdfplumber.open(file_bytes) as pdf:
         text = pdf.pages[0].extract_text() or ""
-        lines = text.splitlines()
-        for line in lines:
+        for line in text.splitlines():
             match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
             if match:
                 date_text = match.group(1).strip()
@@ -148,7 +145,7 @@ def extract_metadata_from_pdf(file_bytes):
                 except:
                     pass
                 break
-        for line in lines:
+        for line in text.splitlines():
             match = re.search(r"Account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
             if match:
                 metadata["Account_Number"] = match.group(1).strip()
@@ -162,7 +159,7 @@ def process_pdf(file_io):
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
 
-    # Consolidate charges by standardizing the charge type and summing amounts.
+    # Consolidate charges by standardizing their type.
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -197,7 +194,7 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build the output row by merging metadata with consolidated charges.
+    # Build the final output row.
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
