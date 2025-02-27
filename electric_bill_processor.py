@@ -76,8 +76,8 @@ def standardize_charge_type(charge_type):
     return charge_type
 
 # --- Key Helper: Extract Total Use (unchanged) ---
-def extract_total_use_from_pdf(file_bytes):
-    with pdfplumber.open(file_bytes) as pdf:
+def extract_total_use_from_pdf(file_io):  # Changed parameter to file_io
+    with pdfplumber.open(file_io) as pdf:
         if len(pdf.pages) < 2:
             return ""
         page = pdf.pages[1]
@@ -99,18 +99,18 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust Table Detection without Erroneous BBox) ---
-def extract_charges_from_pdf(file_bytes):
+# --- Updated: Extract Charges from PDF (Fix Parsing and Boundaries) ---
+def extract_charges_from_pdf(file_io):
     rows_out = []
     
-    with pdfplumber.open(file_bytes) as pdf:
+    with pdfplumber.open(file_io) as pdf:
         for page_num, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             text_lower = text.lower()
 
             # Try to detect tables with specific headers
             tables = page.find_tables({
-                "vertical_strategy": "text",  # Use text alignment for flexibility
+                "vertical_strategy": "text",
                 "horizontal_strategy": "text",
                 "snap_tolerance": 5,
                 "join_tolerance": 5,
@@ -127,7 +127,7 @@ def extract_charges_from_pdf(file_bytes):
                         type_idx = headers.index("type of charge")
                         calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
                         amount_idx = headers.index("amount($)")
-                        table_bbox = table.bbox  # (x0, top, x1, bottom) for debug
+                        table_bbox = table.bbox
                         st.write(f"Page {page_num}: Table bounds: {table_bbox}")
 
                         for i, row in enumerate(extracted_table[1:], start=1):
@@ -154,7 +154,7 @@ def extract_charges_from_pdf(file_bytes):
                                 st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                                 continue
 
-            # Fallback: Text-based extraction with better table boundary detection
+            # Fallback: Text-based extraction with improved parsing
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
@@ -167,7 +167,7 @@ def extract_charges_from_pdf(file_bytes):
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        amount_match = re.search(r'(-?\d+\.?\d*)(?:,\d{3})*(?:\s*−)?$', line)
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(?:\s*−)?$', line)  # Match currency format
                         if amount_match:
                             amount_text = amount_match.group(0).replace("−", "-")
                             try:
@@ -184,7 +184,7 @@ def extract_charges_from_pdf(file_bytes):
                                 }
                                 rows_out.append(row_data)
                                 st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
-                                if "total" in charge_type.lower() and i < len(lines) - 1 and not any("type of charge" in next_line.lower() for next_line in lines[i+1:] if next_line):
+                                if "total" in charge_type.lower() and (i == len(lines) - 1 or not any("charge" in next_line.lower() or "total" in next_line.lower() for next_line in lines[i+1:])):
                                     st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
                                     in_table = False
                                 current_charge = ""
@@ -193,17 +193,13 @@ def extract_charges_from_pdf(file_bytes):
                                 continue
                         else:
                             current_charge = current_charge + " " + line if current_charge else line
-                        # Stop if no more relevant lines (heuristic based on next lines)
-                        if i < len(lines) - 1 and not any("charge" in next_line.lower() or "total" in next_line.lower() for next_line in lines[i+1:i+5]):
-                            st.write(f"Page {page_num}: No further charge-related lines, ending fallback")
-                            in_table = False
 
             # Look for the final "Total Electric Charges" line across all pages
             if "total electric charges" in text_lower:
                 for line in lines:
                     if "total electric charges" in line.lower():
                         st.write(f"Page {page_num}: Processing final total line: {line}")
-                        amount_match = re.search(r'(-?\d+\.?\d*)(?:,\d{3})*(?:\s*−)?$', line)
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(?:\s*−)?$', line)
                         if amount_match:
                             amount_text = amount_match.group(0).replace("−", "-")
                             try:
@@ -252,7 +248,7 @@ def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
-    total_use = extract_total_use_from_pdf(file_bytes)
+    total_use = extract_total_use_from_pdf(file_io)  # Fixed to use file_io
 
     st.write("Extracted Charges:", charges)
 
