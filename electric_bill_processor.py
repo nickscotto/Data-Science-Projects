@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Include All Totals, Stop at Last Total) ---
+# --- Updated: Extract Charges from PDF (Include Total Electric Charges as Last Row) ---
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
     
@@ -144,7 +144,6 @@ def extract_charges_from_pdf(file_bytes):
                             }
                             rows_out.append(row_data)
                             st.write(f"Page {page_num}: Extracted row: {row_data}")
-                            # Check if this is the last "total" row
                             if "total" in charge_type.lower() and i == len(table[1:]) - 1:
                                 st.write(f"Page {page_num}: Last row is a total, ending table: {charge_type}")
                                 break
@@ -152,7 +151,7 @@ def extract_charges_from_pdf(file_bytes):
                             st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                             continue
             
-            # Enhanced Fallback: Handle multi-line charges, include all totals, stop at last total
+            # Enhanced Fallback: Process Delivery/Supply tables
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
@@ -165,11 +164,11 @@ def extract_charges_from_pdf(file_bytes):
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        amount_match = re.search(r'(-?[\d\.,]+[−-]?$)', line)
+                        amount_match = re.search(r'(-?[\d\.,]+)(−)?$', line)
                         if amount_match:
-                            amount_text = amount_match.group(0)
+                            amount_text = amount_match.group(0).replace("−", "-")
                             try:
-                                amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
+                                amount = float(amount_text.replace("$", "").replace(",", ""))
                                 combined_line = current_charge + " " + line if current_charge else line
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', combined_line)
                                 rate_val = rate_match.group(1) if rate_match else ""
@@ -182,19 +181,38 @@ def extract_charges_from_pdf(file_bytes):
                                 }
                                 rows_out.append(row_data)
                                 st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
-                                # Check if this is the last "total" row
                                 if "total" in charge_type.lower() and i < len(lines) - 1 and "type of charge" not in lines[i + 1].lower():
                                     st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
                                     in_table = False
-                                current_charge = ""  # Reset after extracting a row
+                                current_charge = ""
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Fallback failed to parse amount from '{amount_text}' in line: {line}")
                                 continue
-                        elif "charge" in line.lower() or "adjustment" in line.lower() or "service" in line.lower() or "total" in line.lower():
+                        else:
                             current_charge = current_charge + " " + line if current_charge else line
-                        elif current_charge:
-                            current_charge = current_charge + " " + line  # Continue accumulating if part of multi-line
 
+            # Look for the final "Total Electric Charges" line across all pages
+            if "total electric charges" in text_lower:
+                for line in lines:
+                    if "total electric charges" in line.lower():
+                        st.write(f"Page {page_num}: Processing final total line: {line}")
+                        amount_match = re.search(r'(-?[\d\.,]+)(−)?$', line)
+                        if amount_match:
+                            amount_text = amount_match.group(0).replace("−", "-")
+                            try:
+                                amount = float(amount_text.replace("$", "").replace(",", ""))
+                                # Ensure this is the last row by appending after all others
+                                row_data = {
+                                    "Charge_Type": "Total Electric Charges",
+                                    "Rate": "",
+                                    "Amount": amount
+                                }
+                                # Remove any previous instance to ensure it’s last
+                                rows_out = [r for r in rows_out if r["Charge_Type"] != "Total Electric Charges"]
+                                rows_out.append(row_data)
+                                st.write(f"Page {page_num}: Extracted final total row: {row_data}")
+                            except (ValueError, TypeError):
+                                st.write(f"Page {page_num}: Failed to parse final total from '{amount_text}' in line: {line}")
     
     if not rows_out:
         st.warning("No charges tables found in the PDF.")
