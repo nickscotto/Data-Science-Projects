@@ -18,23 +18,53 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
+# --- Helper: Merge Broken Lines from the PDF Table ---
+def merge_charge_lines(lines):
+    merged = []
+    buffer = ""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Heuristic: if the line does not start with a currency symbol or digit
+        # and the buffer is not empty, then it is likely a continuation of the previous line.
+        if buffer and re.match(r"^[A-Za-z]", line) and not re.search(r'\$\s*\d', line):
+            buffer += " " + line
+        else:
+            if buffer:
+                merged.append(buffer)
+            buffer = line
+    if buffer:
+        merged.append(buffer)
+    return merged
+
 # --- Helper: Standardize Charge Type Names ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
-    # If "First" or "Last" is explicitly mentioned, keep it
+    # Unify columns that have "Total Electric Charges" regardless of the subtext.
+    if "Total Electric Charges" in charge_type:
+        return "Total Electric Charges"
+    # For First charges: remove any numeric token and standardize.
     if "First" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
-        return "Distribution Charge First kWh" if "Distribution" in charge_type else "Transmission First kWh" if "Transmission" in charge_type else charge_type
+        if "Distribution" in charge_type:
+            return "Distribution Charge First kWh"
+        elif "Transmission" in charge_type:
+            return "Transmission Charge First kWh"
+        else:
+            return charge_type
+    # For Last charges.
     elif "Last" in charge_type:
         charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
-        return "Distribution Charge Last kWh" if "Distribution" in charge_type else "Transmission Last kWh" if "Transmission" in charge_type else charge_type
-    elif "Distribution Charge" in charge_type:
-        return "Distribution Charge First kWh"
-    elif "Transmission" in charge_type:
-        return "Transmission First kWh"
-    else:
-        charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
-        charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
+        if "Distribution" in charge_type:
+            return "Distribution Charge Last kWh"
+        elif "Transmission" in charge_type:
+            return "Transmission Charge Last kWh"
+        else:
+            return charge_type
+    # Otherwise, remove extraneous words and numbers.
+    charge_type = re.sub(r'\b(First|Last|Next)\b', '', charge_type).strip()
+    charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
     return charge_type
 
 # --- Key Helper: Extract Total Use (More Robust) ---
@@ -46,7 +76,6 @@ def extract_total_use_from_pdf(file_bytes):
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         
-        # Try header-based extraction
         for i, line in enumerate(lines):
             if "meter energy" in line.lower() and "number total" in line.lower():
                 if i + 1 < len(lines) and "number type" in lines[i + 1].lower() and "days use" in lines[i + 1].lower():
@@ -55,7 +84,6 @@ def extract_total_use_from_pdf(file_bytes):
                         for j in range(len(tokens) - 1, -1, -1):
                             if tokens[j].isdigit():
                                 return tokens[j]
-        # Fallback: look for a data row with "1ND..." and "kWh"
         for line in lines:
             tokens = line.split()
             if (len(tokens) >= 6 and 
@@ -69,7 +97,7 @@ def extract_total_use_from_pdf(file_bytes):
 # --- PDF Extraction Functions ---
 def extract_charges_from_pdf(file_bytes):
     rows = []
-    # The regex now accepts either kWh or kW in the rate portion.
+    # The regex captures: description, an optional rate, and the amount.
     pattern = (
         r"^(?P<desc>.*?)(?:\s+X\s+\$(?P<rate>[\d\.]+(?:[−-])?)(?:\s+per\s+k(?:Wh|W)))?\s+(?P<amount>-?[\d,]+(?:\.\d+)?(?:[−-])?)\s*$"
     )
@@ -77,7 +105,8 @@ def extract_charges_from_pdf(file_bytes):
         for page_index in [1, 2]:
             if page_index < len(pdf.pages):
                 text = pdf.pages[page_index].extract_text() or ""
-                lines = text.splitlines()
+                raw_lines = text.splitlines()
+                lines = merge_charge_lines(raw_lines)
                 header_found = False
                 for line in lines:
                     line = line.strip()
@@ -89,31 +118,14 @@ def extract_charges_from_pdf(file_bytes):
                     if header_found:
                         match = re.match(pattern, line)
                         if match:
-                            # Capture and post-process the description to remove numeric tokens and unit words.
-                            desc = match.group("desc").strip()
-                            desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', desc).strip()
+                            # Remove any embedded numeric tokens (like "11532 kWh") from the description.
+                            desc = re.sub(r'\b\d+\s*k(?:Wh|W)\b', '', match.group("desc").strip()).strip()
                             rate_val = match.group("rate") or ""
                             raw_amount = match.group("amount").replace(",", "")
-                            
-                            # Fix trailing minus signs if any
-                            if rate_val.endswith(("−", "-")):
-                                rate_val = rate_val.rstrip("−-")
-                                if not rate_val.startswith("-"):
-                                    rate_val = "-" + rate_val
-                            if raw_amount.endswith(("−", "-")):
-                                raw_amount = raw_amount.rstrip("−-")
-                                if not raw_amount.startswith("-"):
-                                    raw_amount = "-" + raw_amount
-                            
                             try:
                                 amount = float(raw_amount)
                             except ValueError:
                                 continue
-                            
-                            # Filter out unwanted lines containing common header/footer tokens.
-                            if any(k in desc.lower() for k in ["page", "year", "meter", "temp", "date"]):
-                                continue
-                            
                             rows.append({
                                 "Charge_Type": desc,
                                 "Rate": rate_val,
@@ -150,7 +162,7 @@ def process_pdf(file_io):
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
 
-    # Consolidate charges by standardizing their type
+    # Consolidate charges by standardizing the charge type and summing amounts.
     consolidated = {}
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
@@ -163,7 +175,7 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
-    # Build user_id from account number (stored in session state)
+    # Build or retrieve user and bill IDs.
     account_number = metadata.get("Account_Number", "").replace(" ", "")
     if "customer_ids" not in st.session_state:
         st.session_state.customer_ids = {}
@@ -176,7 +188,6 @@ def process_pdf(file_io):
     else:
         user_id = str(uuid.uuid4())
 
-    # Check for existing bill in the sheet
     existing = worksheet.get_all_records()
     bill_id = None
     for row in existing:
@@ -186,7 +197,7 @@ def process_pdf(file_io):
     if not bill_id:
         bill_id = str(uuid.uuid4())
 
-    # Build output row: merge metadata with consolidated charges
+    # Build the output row by merging metadata with consolidated charges.
     output_row = {
         "User_ID": user_id,
         "Bill_ID": bill_id,
