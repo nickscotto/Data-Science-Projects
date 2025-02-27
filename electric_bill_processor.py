@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Fix Negatives and Total Doubling) ---
+# --- Updated: Extract Charges from PDF ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -167,11 +167,12 @@ def extract_charges_from_pdf(file_io):
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(−)?$', line)  # Capture trailing −
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(−)?$', line)
                         if amount_match:
-                            amount_text = amount_match.group(0).replace("−", "-")
+                            full_amount = amount_match.group(0)
+                            amount_text = full_amount.replace("−", "-").replace(",", "")
                             try:
-                                amount = float(amount_text.replace(",", ""))
+                                amount = float(amount_text)
                                 combined_line = current_charge + " " + line if current_charge else line
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', combined_line)
                                 rate_val = rate_match.group(1) if rate_match else ""
@@ -189,7 +190,7 @@ def extract_charges_from_pdf(file_io):
                                     in_table = False
                                 current_charge = ""
                             except (ValueError, TypeError):
-                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{amount_text}' in line: {line}")
+                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{full_amount}' in line: {line}")
                                 continue
                         else:
                             current_charge = current_charge + " " + line if current_charge else line
@@ -201,13 +202,15 @@ def extract_charges_from_pdf(file_io):
                         st.write(f"Page {page_num}: Processing final total line: {line}")
                         amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(−)?$', line)
                         if amount_match:
-                            amount_text = amount_match.group(0).replace("−", "-")
+                            full_amount = amount_match.group(0)
+                            amount_text = full_amount.replace("−", "-").replace(",", "")
                             try:
-                                amount = float(amount_text.replace(",", ""))
+                                amount = float(amount_text)
                                 # Check for existing Total Electric Charges and update if variant found
                                 total_exists = next((r for r in rows_out if "total electric charges" in r["Charge_Type"].lower()), None)
                                 if total_exists:
-                                    total_exists["Amount"] = amount  # Update existing entry
+                                    total_exists["Amount"] = amount
+                                    total_exists["Charge_Type"] = "Total Electric Charges"  # Standardize to base name
                                     st.write(f"Page {page_num}: Updated existing Total Electric Charges to: {amount}")
                                 else:
                                     row_data = {
@@ -218,33 +221,39 @@ def extract_charges_from_pdf(file_io):
                                     rows_out.append(row_data)
                                     st.write(f"Page {page_num}: Extracted final total row: {row_data}")
                             except (ValueError, TypeError):
-                                st.write(f"Page {page_num}: Failed to parse final total from '{amount_text}' in line: {line}")
+                                st.write(f"Page {page_num}: Failed to parse final total from '{full_amount}' in line: {line}")
 
     if not rows_out:
-        st.warning("No charges tables found in the PDF.")
+        st.write("No charges tables found in the PDF.")
     else:
         st.write(f"Total charges extracted: {len(rows_out)}")
     return rows_out
 
-# --- Extract Metadata from PDF (unchanged) ---
+# --- Extract Metadata from PDF (Updated with Debugging) ---
 def extract_metadata_from_pdf(file_bytes):
     metadata = {"Bill_Month_Year": "", "Account_Number": ""}
     with pdfplumber.open(file_bytes) as pdf:
-        text = pdf.pages[0].extract_text() or ""
-        for line in text.splitlines():
-            match = re.search(r"Bill Issue date:\s*(.+)", line, re.IGNORECASE)
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text() or ""  # Concatenate text from all pages
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        st.write("Metadata lines checked:", lines)  # Debug all lines
+        for line in lines:
+            match = re.search(r"(?:Account\s*(?:number|#)\s*:?\s*|\bAcct\s*#?\s*)(\d{4}\s*\d{4}\s*\d{3})", line, re.IGNORECASE)
+            if match:
+                metadata["Account_Number"] = match.group(1).replace(" ", "")
+                st.write(f"Extracted Account Number (not stored): {metadata['Account_Number']}")
+                break
+        for line in lines:
+            match = re.search(r"Bill\s*Issue\s*date:\s*(.+)", line, re.IGNORECASE)
             if match:
                 date_text = match.group(1).strip()
                 try:
                     parsed_date = date_parse(date_text, fuzzy=True)
-                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-Y")
-                except:
-                    pass
-                break
-        for line in text.splitlines():
-            match = re.search(r"Account\s*number:\s*([\d\s]+)", line, re.IGNORECASE)
-            if match:
-                metadata["Account_Number"] = match.group(1).strip()
+                    metadata["Bill_Month_Year"] = parsed_date.strftime("%m-%Y")
+                    st.write(f"Extracted Bill Month Year: {metadata['Bill_Month_Year']}")
+                except Exception as e:
+                    st.write(f"Failed to parse date from '{date_text}': {e}")
                 break
     return metadata
 
@@ -280,8 +289,10 @@ def process_pdf(file_io):
         else:
             user_id = str(uuid.uuid4())
             st.session_state.customer_ids[account_number] = user_id
+            st.write(f"New User_ID generated for Account_Number {account_number}: {user_id}")
     else:
         user_id = str(uuid.uuid4())
+        st.write(f"No Account_Number found, generated new User_ID: {user_id}")
 
     existing = worksheet.get_all_records()
     bill_id = None
