@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust, Page-Agnostic, Debugged) ---
+# --- Updated: Extract Charges from PDF (Improved Text Fallback) ---
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
     
@@ -108,7 +108,7 @@ def extract_charges_from_pdf(file_bytes):
             text = page.extract_text() or ""
             text_lower = text.lower()
 
-            # Try table detection for charges tables
+            # Try table detection
             table = page.extract_table({
                 "vertical_strategy": "lines",
                 "horizontal_strategy": "lines",
@@ -150,10 +150,11 @@ def extract_charges_from_pdf(file_bytes):
                             st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                             continue
             
-            # Fallback: Text-based extraction if no table detected or context suggests charges
+            # Enhanced Fallback: Text-based extraction with better row parsing
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
+                st.write(f"Page {page_num}: Processing lines for fallback:")
                 for i, line in enumerate(lines):
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
                         in_table = True
@@ -162,16 +163,21 @@ def extract_charges_from_pdf(file_bytes):
                     if in_table:
                         if "total" in line.lower():
                             in_table = False
+                            st.write(f"Page {page_num}: Stopped at total line: {line}")
                             continue
-                        tokens = re.split(r'\s{2,}', line)
-                        if len(tokens) >= 2:
-                            charge_type = tokens[0].strip()
-                            amount_text = tokens[-1].strip()
-                            calc_text = " ".join(tokens[1:-1]).strip() if len(tokens) > 2 else ""
+                        st.write(f"Page {page_num}: Processing line: {line}")
+                        # Improved parsing: Look for amount at the end and rate in the middle
+                        amount_match = re.search(r'[\d\.,]+[−-]?$', line)
+                        if amount_match:
+                            amount_text = amount_match.group(0)
                             try:
                                 amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
-                                rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
+                                # Extract rate if present
+                                rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', line)
                                 rate_val = rate_match.group(1) if rate_match else ""
+                                # Charge type is everything before the rate or amount
+                                charge_type_end = line.find("X $") if rate_val else amount_match.start()
+                                charge_type = line[:charge_type_end].strip() if charge_type_end > 0 else line.strip()
                                 row_data = {
                                     "Charge_Type": charge_type,
                                     "Rate": rate_val,
@@ -185,6 +191,8 @@ def extract_charges_from_pdf(file_bytes):
     
     if not rows_out:
         st.warning("No charges tables found in the PDF.")
+    else:
+        st.write(f"Total charges extracted: {len(rows_out)}")
     return rows_out
 
 # --- Extract Metadata from PDF (unchanged) ---
@@ -209,14 +217,14 @@ def extract_metadata_from_pdf(file_bytes):
                 break
     return metadata
 
-# --- Main PDF Processing Function (Updated with Debugging) ---
+# --- Main PDF Processing Function ---
 def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
     total_use = extract_total_use_from_pdf(file_io)
 
-    # Debugging: Display extracted charges
+    # Debugging
     st.write("Extracted Charges:", charges)
 
     consolidated = {}
@@ -231,7 +239,6 @@ def process_pdf(file_io):
         else:
             consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
-    # Debugging: Display consolidated charges
     st.write("Consolidated Charges:", consolidated)
 
     account_number = metadata.get("Account_Number", "").replace(" ", "")
@@ -268,7 +275,6 @@ def process_pdf(file_io):
         if consolidated[ct]["Rate"]:
             output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
 
-    # Debugging: Display final output row
     st.write("Final Output Row:", output_row)
     return output_row
 
@@ -300,7 +306,7 @@ def append_row_to_sheet(row_dict):
     row_values = [str(row_dict.get(h, "")) for h in full_headers]
     worksheet.append_row(row_values)
 
-# --- Streamlit App Interface (Updated with Debugging) ---
+# --- Streamlit App Interface ---
 st.title("Delmarva BillWatch")
 st.write("Upload your PDF bill. Your deidentified utility charge information will be stored in Google Sheets.")
 st.write("**Privacy Disclaimer:** By submitting your form, you agree that your response may be used to support an investigation into billing issues with Delmarva Power. Your information will not be shared publicly or sold. This form is for informational and organizational purposes only and does not constitute legal representation.")
