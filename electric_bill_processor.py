@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_bytes):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Include Total Electric Charges as Last Row) ---
+# --- Updated: Extract Charges from PDF (Robust Table Detection with Bounding Boxes) ---
 def extract_charges_from_pdf(file_bytes):
     rows_out = []
     
@@ -108,50 +108,53 @@ def extract_charges_from_pdf(file_bytes):
             text = page.extract_text() or ""
             text_lower = text.lower()
 
-            # Try table detection
-            table = page.extract_table({
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
+            # Try to detect tables with specific headers
+            tables = page.find_tables({
+                "vertical_strategy": "text",  # Use text alignment for flexibility
+                "horizontal_strategy": "text",
                 "snap_tolerance": 5,
                 "join_tolerance": 5,
                 "edge_min_length": 3,
                 "intersection_tolerance": 5,
             })
             
-            if table and len(table) > 1:
-                headers = [h.lower() if h else "" for h in table[0]]
-                if "type of charge" in headers and "amount($)" in headers:
-                    st.write(f"Page {page_num}: Found table with headers: {headers}")
-                    type_idx = headers.index("type of charge")
-                    calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
-                    amount_idx = headers.index("amount($)")
-                    
-                    for i, row in enumerate(table[1:]):
-                        if len(row) <= max(type_idx, calc_idx, amount_idx):
-                            continue
-                        charge_type = row[type_idx].strip() if row[type_idx] else ""
-                        amount_text = row[amount_idx].strip() if row[amount_idx] else ""
-                        calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
-                        
-                        try:
-                            amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
-                            rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
-                            rate_val = rate_match.group(1) if rate_match else ""
-                            row_data = {
-                                "Charge_Type": charge_type,
-                                "Rate": rate_val,
-                                "Amount": amount
-                            }
-                            rows_out.append(row_data)
-                            st.write(f"Page {page_num}: Extracted row: {row_data}")
-                            if "total" in charge_type.lower() and i == len(table[1:]) - 1:
-                                st.write(f"Page {page_num}: Last row is a total, ending table: {charge_type}")
-                                break
-                        except (ValueError, TypeError):
-                            st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
-                            continue
-            
-            # Enhanced Fallback: Process Delivery/Supply tables
+            for table in tables:
+                extracted_table = table.extract()
+                if extracted_table and len(extracted_table) > 1:
+                    headers = [h.lower() if h else "" for h in extracted_table[0]]
+                    if "type of charge" in headers and "amount($)" in headers:
+                        st.write(f"Page {page_num}: Found charges table with headers: {headers}")
+                        type_idx = headers.index("type of charge")
+                        calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
+                        amount_idx = headers.index("amount($)")
+                        table_bbox = table.bbox  # (x0, top, x1, bottom) of the table
+                        st.write(f"Page {page_num}: Table bounds: {table_bbox}")
+
+                        for i, row in enumerate(extracted_table[1:], start=1):
+                            if len(row) <= max(type_idx, calc_idx, amount_idx):
+                                continue
+                            charge_type = row[type_idx].strip() if row[type_idx] else ""
+                            amount_text = row[amount_idx].strip() if row[amount_idx] else ""
+                            
+                            try:
+                                amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
+                                calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
+                                rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
+                                rate_val = rate_match.group(1) if rate_match else ""
+                                row_data = {
+                                    "Charge_Type": charge_type,
+                                    "Rate": rate_val,
+                                    "Amount": amount
+                                }
+                                rows_out.append(row_data)
+                                st.write(f"Page {page_num}: Extracted row: {row_data}")
+                                if "total" in charge_type.lower() and i == len(extracted_table[1:]):
+                                    st.write(f"Page {page_num}: Last row is a total, ending table: {charge_type}")
+                            except (ValueError, TypeError):
+                                st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
+                                continue
+
+            # Fallback: Text-based extraction if no table detected, with spatial context
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
@@ -161,14 +164,20 @@ def extract_charges_from_pdf(file_bytes):
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
                         in_table = True
                         st.write(f"Page {page_num}: Detected table header in text: {line}")
+                        # Estimate table start position (approximate based on header)
+                        header_words = page.extract_words(bbox=(0, page.height / 2, page.width, page.height))
+                        if header_words:
+                            header_y = header_words[0]['top']
+                            table_start_y = header_y - 10  # Buffer above header
+                            st.write(f"Page {page_num}: Estimated table start y: {table_start_y}")
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        amount_match = re.search(r'(-?[\d\.,]+)(−)?$', line)
+                        amount_match = re.search(r'(-?\d+\.?\d*)(?:,\d{3})*(?:\s*−)?$', line)
                         if amount_match:
                             amount_text = amount_match.group(0).replace("−", "-")
                             try:
-                                amount = float(amount_text.replace("$", "").replace(",", ""))
+                                amount = float(amount_text.replace(",", ""))
                                 combined_line = current_charge + " " + line if current_charge else line
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', combined_line)
                                 rate_val = rate_match.group(1) if rate_match else ""
@@ -190,30 +199,33 @@ def extract_charges_from_pdf(file_bytes):
                                 continue
                         else:
                             current_charge = current_charge + " " + line if current_charge else line
+                        # Stop if line is outside estimated table bounds (rough heuristic)
+                        words = page.extract_words()
+                        if words and words[-1]['top'] > table_start_y + 200:  # Arbitrary height limit
+                            st.write(f"Page {page_num}: Exceeded table height, ending fallback")
+                            in_table = False
 
             # Look for the final "Total Electric Charges" line across all pages
             if "total electric charges" in text_lower:
                 for line in lines:
                     if "total electric charges" in line.lower():
                         st.write(f"Page {page_num}: Processing final total line: {line}")
-                        amount_match = re.search(r'(-?[\d\.,]+)(−)?$', line)
+                        amount_match = re.search(r'(-?\d+\.?\d*)(?:,\d{3})*(?:\s*−)?$', line)
                         if amount_match:
                             amount_text = amount_match.group(0).replace("−", "-")
                             try:
-                                amount = float(amount_text.replace("$", "").replace(",", ""))
-                                # Ensure this is the last row by appending after all others
+                                amount = float(amount_text.replace(",", ""))
                                 row_data = {
                                     "Charge_Type": "Total Electric Charges",
                                     "Rate": "",
                                     "Amount": amount
                                 }
-                                # Remove any previous instance to ensure it’s last
                                 rows_out = [r for r in rows_out if r["Charge_Type"] != "Total Electric Charges"]
                                 rows_out.append(row_data)
                                 st.write(f"Page {page_num}: Extracted final total row: {row_data}")
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Failed to parse final total from '{amount_text}' in line: {line}")
-    
+
     if not rows_out:
         st.warning("No charges tables found in the PDF.")
     else:
@@ -247,7 +259,7 @@ def process_pdf(file_io):
     bill_hash = hashlib.md5(file_io.getvalue()).hexdigest()
     charges = extract_charges_from_pdf(file_io)
     metadata = extract_metadata_from_pdf(file_io)
-    total_use = extract_total_use_from_pdf(file_io)
+    total_use = extract_total_use_from_pdf(file_bytes)
 
     st.write("Extracted Charges:", charges)
 
