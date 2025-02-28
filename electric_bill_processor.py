@@ -1,4 +1,4 @@
-import streamlit as st
+import streamlit as st 
 import io
 import re
 import uuid
@@ -169,12 +169,15 @@ def extract_charges_from_pdf(file_io):
                         st.write(f"Page {page_num}: Processing line: {line}")
                         # Preprocess to replace − with - globally
                         cleaned_line = re.sub(r'−', '-', line)
-                        # Match amount at the end of the line, allowing negative sign anywhere
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})$', cleaned_line)
+                        # Match amount at the end of the line, allowing an optional trailing '-' 
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?$', cleaned_line)
                         if amount_match:
-                            amount_text = amount_match.group(0).replace(",", "")
+                            num_str = amount_match.group(1)
+                            # If a trailing '-' is present and num_str doesn't already start with '-', prepend it
+                            if amount_match.group(2) == '-' and not num_str.startswith('-'):
+                                num_str = '-' + num_str
                             try:
-                                amount = float(amount_text)
+                                amount = float(num_str.replace(",", ""))
                                 # Extract charge type and rate from the current line only
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', line)
                                 rate_val = rate_match.group(1) if rate_match else ""
@@ -192,7 +195,7 @@ def extract_charges_from_pdf(file_io):
                                         in_table = False
                                 current_charge = ""  # Reset after each successful match
                             except (ValueError, TypeError):
-                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{amount_text}' in line: {cleaned_line}")
+                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{num_str}' in line: {cleaned_line}")
                                 continue
                         elif re.search(r'(?:charge|tax|total)', line.lower()) and not current_charge:
                             current_charge = line  # Start accumulating only if no prior context
@@ -205,11 +208,13 @@ def extract_charges_from_pdf(file_io):
                     if "total electric charges" in line.lower():
                         st.write(f"Page {page_num}: Processing final total line: {line}")
                         cleaned_line = re.sub(r'−', '-', line)
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})$', cleaned_line)
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?$', cleaned_line)
                         if amount_match:
-                            amount_text = amount_match.group(0).replace(",", "")
+                            num_str = amount_match.group(1)
+                            if amount_match.group(2) == '-' and not num_str.startswith('-'):
+                                num_str = '-' + num_str
                             try:
-                                amount = float(amount_text)
+                                amount = float(num_str.replace(",", ""))
                                 total_exists = next((r for r in rows_out if "total electric charges" in r["Charge_Type"].lower()), None)
                                 if total_exists:
                                     total_exists["Amount"] = amount
@@ -224,7 +229,7 @@ def extract_charges_from_pdf(file_io):
                                     rows_out.append(row_data)
                                     st.write(f"Page {page_num}: Extracted final total row: {row_data}")
                             except (ValueError, TypeError):
-                                st.write(f"Page {page_num}: Failed to parse final total from '{amount_text}' in line: {cleaned_line}")
+                                st.write(f"Page {page_num}: Failed to parse final total from '{num_str}' in line: {cleaned_line}")
 
     if not rows_out:
         st.write("No charges tables found in the PDF.")
