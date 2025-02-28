@@ -107,7 +107,7 @@ def extract_charges_from_pdf(file_io):
             words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
             rows = {}
             for w in words:
-                row_key = round(w['top'], -1)  # cluster words into rows vertically
+                row_key = round(w['top'], -1)  # cluster words vertically into rows
                 rows.setdefault(row_key, []).append((w['x0'], w['text']))
             
             sorted_rows = [rows[key] for key in sorted(rows.keys())]
@@ -116,7 +116,7 @@ def extract_charges_from_pdf(file_io):
             for row in sorted_rows:
                 row.sort(key=lambda x: x[0])
                 row_text = " ".join(x[1] for x in row).lower()
-                
+
                 if "type of charge" in row_text and "amount($)" in row_text:
                     headers = {cell.strip(): idx for idx, cell in enumerate([x[1].lower() for x in row])}
                     table_started = True
@@ -124,7 +124,7 @@ def extract_charges_from_pdf(file_io):
                 
                 if table_started:
                     if len(row) < len(headers):
-                        continue  # likely an incomplete or merged row
+                        continue  # skip incomplete rows
                     
                     # map columns according to previously detected headers
                     cells = [x[1] for x in row]
@@ -135,7 +135,7 @@ def extract_charges_from_pdf(file_io):
                     try:
                         amount = float(amount_str)
                     except ValueError:
-                        continue  # skip rows if amounts can't be parsed
+                        continue  # skip rows if amounts fail to parse
 
                     rate_match = re.search(r"\$\s?([0-9]+\.\d{2,})", how_calc)
                     rate = rate_match.group(1) if rate_match else ""
@@ -147,13 +147,9 @@ def extract_charges_from_pdf(file_io):
                     }
                     rows_out.append(row_data)
                     
-                # Detect end of table explicitly
+                # explicitly end table extraction at known footer keywords
                 if table_started and ('total electric delivery charges' in row_text or 'status of your deferred payment arrangement' in row_text):
-                    table_started = False  # stop processing after reaching known footer info
-
-    # Fallback extraction logic left exactly as-is below (no changes needed)
-    # ...
-
+                    table_started = False  # clearly stop table parsing here
     return rows_out
 # --- Extract Metadata from PDF (unchanged) ---
 def extract_metadata_from_pdf(file_bytes):
