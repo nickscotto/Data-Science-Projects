@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF ---
+# --- Updated: Extract Charges from PDF (Fix Negative Amounts) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -167,10 +167,11 @@ def extract_charges_from_pdf(file_io):
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(−)?$', line)
+                        # Preprocess line to replace − with - before matching
+                        cleaned_line = re.sub(r'−', '-', line)
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})$', cleaned_line)
                         if amount_match:
-                            full_amount = amount_match.group(0)
-                            amount_text = full_amount.replace("−", "-").replace(",", "")
+                            amount_text = amount_match.group(0).replace(",", "")
                             try:
                                 amount = float(amount_text)
                                 combined_line = current_charge + " " + line if current_charge else line
@@ -190,7 +191,7 @@ def extract_charges_from_pdf(file_io):
                                     in_table = False
                                 current_charge = ""
                             except (ValueError, TypeError):
-                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{full_amount}' in line: {line}")
+                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{amount_text}' in line: {cleaned_line}")
                                 continue
                         else:
                             current_charge = current_charge + " " + line if current_charge else line
@@ -200,10 +201,10 @@ def extract_charges_from_pdf(file_io):
                 for line in lines:
                     if "total electric charges" in line.lower():
                         st.write(f"Page {page_num}: Processing final total line: {line}")
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(−)?$', line)
+                        cleaned_line = re.sub(r'−', '-', line)
+                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})$', cleaned_line)
                         if amount_match:
-                            full_amount = amount_match.group(0)
-                            amount_text = full_amount.replace("−", "-").replace(",", "")
+                            amount_text = amount_match.group(0).replace(",", "")
                             try:
                                 amount = float(amount_text)
                                 # Check for existing Total Electric Charges and update if variant found
@@ -221,7 +222,7 @@ def extract_charges_from_pdf(file_io):
                                     rows_out.append(row_data)
                                     st.write(f"Page {page_num}: Extracted final total row: {row_data}")
                             except (ValueError, TypeError):
-                                st.write(f"Page {page_num}: Failed to parse final total from '{full_amount}' in line: {line}")
+                                st.write(f"Page {page_num}: Failed to parse final total from '{amount_text}' in line: {cleaned_line}")
 
     if not rows_out:
         st.write("No charges tables found in the PDF.")
@@ -229,7 +230,7 @@ def extract_charges_from_pdf(file_io):
         st.write(f"Total charges extracted: {len(rows_out)}")
     return rows_out
 
-# --- Extract Metadata from PDF (Updated with Debugging) ---
+# --- Extract Metadata from PDF (unchanged) ---
 def extract_metadata_from_pdf(file_bytes):
     metadata = {"Bill_Month_Year": "", "Account_Number": ""}
     with pdfplumber.open(file_bytes) as pdf:
