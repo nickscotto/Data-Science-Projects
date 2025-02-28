@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust Negative Amount & Rate Parsing) ---
+# --- Updated: Extract Charges from PDF (Robust Negative Amount & Rate Parsing with Line Accumulation) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -159,7 +159,7 @@ def extract_charges_from_pdf(file_io):
                                 st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                                 continue
 
-            # Fallback: Text-based extraction with robust negative parsing
+            # Fallback: Text-based extraction with robust negative parsing and line accumulation
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
@@ -174,7 +174,7 @@ def extract_charges_from_pdf(file_io):
                         st.write(f"Page {page_num}: Processing line: {line}")
                         # Preprocess to replace − with - globally
                         cleaned_line = re.sub(r'−', '-', line)
-                        # Match amount at the end of the line, allowing an optional trailing '-' 
+                        # Match amount at the end of the line, allowing an optional trailing '-'
                         amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?$', cleaned_line)
                         if amount_match:
                             num_str = amount_match.group(1)
@@ -189,8 +189,14 @@ def extract_charges_from_pdf(file_io):
                                         rate_val = '-' + rate_val[:-1]
                                 else:
                                     rate_val = ""
-                                charge_type = cleaned_line[:amount_match.start()].strip() if amount_match.start() > 0 else cleaned_line.strip()
-                                # Allow extraction if the charge type contains keywords OR if the amount is negative
+                                # Get the text before the amount match
+                                extracted_text = cleaned_line[:amount_match.start()].strip() if amount_match.start() > 0 else cleaned_line.strip()
+                                # If there is accumulated text from previous lines, prepend it.
+                                if current_charge:
+                                    charge_type = current_charge + " " + extracted_text
+                                else:
+                                    charge_type = extracted_text
+                                # Only extract if the text has relevant keywords or the amount is negative
                                 if any(keyword in charge_type.lower() for keyword in ["charge", "tax", "total"]) or amount < 0:
                                     row_data = {
                                         "Charge_Type": charge_type,
@@ -202,14 +208,16 @@ def extract_charges_from_pdf(file_io):
                                     if "total" in charge_type.lower() and (i == len(lines) - 1 or not any("charge" in next_line.lower() or "total" in next_line.lower() for next_line in lines[i+1:])):
                                         st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
                                         in_table = False
-                                current_charge = ""  # Reset after each successful match
+                                current_charge = ""  # Reset after processing a complete charge
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Fallback failed to parse amount from '{num_str}' in line: {cleaned_line}")
                                 continue
-                        elif re.search(r'(?:charge|tax|total)', line.lower()) and not current_charge:
-                            current_charge = line  # Start accumulating only if no prior context
-                        elif current_charge and not amount_match:
-                            current_charge += " " + line  # Continue accumulating multi-line charges
+                        else:
+                            # Accumulate lines that do not yet contain an amount
+                            if current_charge:
+                                current_charge += " " + line
+                            else:
+                                current_charge = line
 
             # Look for the final "Total Electric Charges" line across all pages
             if "total electric charges" in text_lower:
@@ -252,9 +260,9 @@ def extract_metadata_from_pdf(file_bytes):
     with pdfplumber.open(file_bytes) as pdf:
         text = ""
         for page in pdf.pages:
-            text += page.extract_text() or ""  # Concatenate text from all pages
+            text += page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
-        st.write("Metadata lines checked:", lines)  # Debug all lines
+        st.write("Metadata lines checked:", lines)
         for line in lines:
             match = re.search(r"(?:Account\s*(?:number|#)\s*:?\s*|\bAcct\s*#?\s*)(\d{4}\s*\d{4}\s*\d{3})", line, re.IGNORECASE)
             if match:
