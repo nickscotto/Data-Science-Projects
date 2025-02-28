@@ -3,6 +3,7 @@ import io
 import re
 import uuid
 import hashlib
+import tempfile
 from datetime import datetime
 from dateutil.parser import parse as date_parse
 import pdfplumber
@@ -99,16 +100,17 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust Negative Amount & Improved Fallback Column Parsing) ---
+# --- Updated: Extract Charges from PDF with Camelot Fallback ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
+    # First pass: using pdfplumber extraction
     with pdfplumber.open(file_io) as pdf:
         for page_num, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             text_lower = text.lower()
 
-            # -- Table-based extraction (unchanged) --
+            # -- Table-based extraction using pdfplumber --
             tables = page.find_tables({
                 "vertical_strategy": "text",
                 "horizontal_strategy": "text",
@@ -159,10 +161,7 @@ def extract_charges_from_pdf(file_io):
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
                 accumulated_row = ""
-                
-                # Helper to process an accumulated block.
                 def process_fallback_row(row_text):
-                    # Pattern: capture everything (non-greedily) up to an amount at the end.
                     pattern = r'(.*?)(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$'
                     m = re.search(pattern, row_text)
                     if not m:
@@ -175,7 +174,6 @@ def extract_charges_from_pdf(file_io):
                         amount_val = float(amount_str.replace(",", ""))
                     except:
                         return None
-                    # Now split text_before on "X $" to separate charge type and rate.
                     if "X $" in text_before:
                         parts = text_before.split("X $", 1)
                         charge = parts[0].strip()
@@ -194,21 +192,14 @@ def extract_charges_from_pdf(file_io):
                 
                 st.write(f"Page {page_num}: Processing lines for fallback:")
                 for i, line in enumerate(lines):
-                    # Start processing after detecting the header.
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
                         in_table = True
                         st.write(f"Page {page_num}: Detected table header in text: {line}")
                         continue
                     if not in_table:
                         continue
-                    # Clean the line (e.g. replace special minus signs)
                     clean_line = re.sub(r'−', '-', line)
-                    # Always append the current line to the accumulator.
-                    if accumulated_row:
-                        accumulated_row += " " + clean_line
-                    else:
-                        accumulated_row = clean_line
-                    # Check if the accumulator ends with a pattern that looks like an amount.
+                    accumulated_row = accumulated_row + " " + clean_line if accumulated_row else clean_line
                     if re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$', accumulated_row):
                         result = process_fallback_row(accumulated_row)
                         if result:
@@ -219,8 +210,7 @@ def extract_charges_from_pdf(file_io):
                                 "Amount": amt
                             })
                             st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
-                        accumulated_row = ""  # reset accumulator
-                # Process any remaining accumulated text.
+                        accumulated_row = ""
                 if accumulated_row:
                     result = process_fallback_row(accumulated_row)
                     if result:
@@ -233,7 +223,7 @@ def extract_charges_from_pdf(file_io):
                         st.write(f"Page {page_num}: Fallback extracted row (end): {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
                     accumulated_row = ""
 
-            # -- Process final "Total Electric Charges" line across pages --
+            # -- Process final "Total Electric Charges" line --
             if "total electric charges" in text_lower:
                 for line in text.splitlines():
                     if "total electric charges" in line.lower():
@@ -262,8 +252,56 @@ def extract_charges_from_pdf(file_io):
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Failed to parse final total from '{num_str}' in line: {cleaned_line}")
 
+    # If pdfplumber didn't extract any rows, fallback to Camelot extraction.
     if not rows_out:
-        st.write("No charges tables found in the PDF.")
+        st.write("No charges tables found with pdfplumber, trying Camelot extraction as fallback.")
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_io.getvalue())
+            tmp_file_path = tmp_file.name
+        try:
+            import camelot
+            # Adjust table_areas as needed for your PDFs.
+            camelot_tables = camelot.read_pdf(tmp_file_path, table_areas=['50,500,500,50'], flavor='stream')
+            for idx, table in enumerate(camelot_tables):
+                st.write(f"Camelot Table {idx} extraction:")
+                df = table.df
+                if df.empty or df.shape[1] < 3:
+                    continue
+                headers = df.iloc[0].str.lower().tolist()
+                if "type of charge" in headers and "amount($)" in headers:
+                    type_idx = headers.index("type of charge")
+                    calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
+                    amount_idx = headers.index("amount($)")
+                    for i in range(1, len(df)):
+                        row = df.iloc[i].tolist()
+                        if len(row) <= max(type_idx, calc_idx, amount_idx):
+                            continue
+                        charge_type = row[type_idx].strip() if row[type_idx] else ""
+                        amount_text = row[amount_idx].strip() if row[amount_idx] else ""
+                        try:
+                            amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
+                            calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
+                            rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
+                            if rate_match:
+                                rate_val = rate_match.group(1)
+                                if rate_val.endswith('-'):
+                                    rate_val = '-' + rate_val[:-1]
+                            else:
+                                rate_val = ""
+                            row_data = {
+                                "Charge_Type": charge_type,
+                                "Rate": rate_val,
+                                "Amount": amount
+                            }
+                            rows_out.append(row_data)
+                            st.write(f"Camelot extracted row: {row_data}")
+                        except (ValueError, TypeError):
+                            st.write(f"Camelot failed to parse amount from '{amount_text}' in row: {row}")
+        except Exception as e:
+            st.write("Camelot extraction error: ", e)
+    
+    if not rows_out:
+        st.write("No charges extracted from the PDF.")
     else:
         st.write(f"Total charges extracted: {len(rows_out)}")
     return rows_out
