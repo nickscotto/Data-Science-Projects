@@ -160,8 +160,9 @@ def extract_charges_from_pdf(file_io):
                 in_table = False
                 accumulated_row = ""
                 
-                # Helper to process an accumulated row
+                # Helper to process an accumulated block.
                 def process_fallback_row(row_text):
+                    # Pattern: capture everything (non-greedily) up to an amount at the end.
                     pattern = r'(.*?)(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$'
                     m = re.search(pattern, row_text)
                     if not m:
@@ -174,7 +175,7 @@ def extract_charges_from_pdf(file_io):
                         amount_val = float(amount_str.replace(",", ""))
                     except:
                         return None
-                    # Look for rate using the delimiter "X $"
+                    # Now split text_before on "X $" to separate charge type and rate.
                     if "X $" in text_before:
                         parts = text_before.split("X $", 1)
                         charge = parts[0].strip()
@@ -193,48 +194,33 @@ def extract_charges_from_pdf(file_io):
                 
                 st.write(f"Page {page_num}: Processing lines for fallback:")
                 for i, line in enumerate(lines):
-                    # Detect header to start processing fallback rows.
+                    # Start processing after detecting the header.
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
                         in_table = True
                         st.write(f"Page {page_num}: Detected table header in text: {line}")
                         continue
                     if not in_table:
                         continue
-                    # Clean the current line
+                    # Clean the line (e.g. replace special minus signs)
                     clean_line = re.sub(r'−', '-', line)
-                    # Check if the current line itself contains an amount.
-                    if re.search(r'(-?\d{1,3}(?:,\d{1,3})*\.\d{2})(-)?\s*$', clean_line):
-                        # If we already have accumulated text, process it first.
-                        if accumulated_row:
-                            result = process_fallback_row(accumulated_row)
-                            if result:
-                                ch_type, rate_val, amt = result
-                                rows_out.append({
-                                    "Charge_Type": ch_type,
-                                    "Rate": rate_val,
-                                    "Amount": amt
-                                })
-                                st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
-                            accumulated_row = clean_line  # start new row with current line
-                        else:
-                            # No accumulation; process current line immediately.
-                            result = process_fallback_row(clean_line)
-                            if result:
-                                ch_type, rate_val, amt = result
-                                rows_out.append({
-                                    "Charge_Type": ch_type,
-                                    "Rate": rate_val,
-                                    "Amount": amt
-                                })
-                                st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
-                            accumulated_row = ""  # reset
+                    # Always append the current line to the accumulator.
+                    if accumulated_row:
+                        accumulated_row += " " + clean_line
                     else:
-                        # No amount in the current line; accumulate.
-                        if accumulated_row:
-                            accumulated_row += " " + clean_line
-                        else:
-                            accumulated_row = clean_line
-                # End of lines – if anything remains, try to process it.
+                        accumulated_row = clean_line
+                    # Check if the accumulator ends with a pattern that looks like an amount.
+                    if re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$', accumulated_row):
+                        result = process_fallback_row(accumulated_row)
+                        if result:
+                            ch_type, rate_val, amt = result
+                            rows_out.append({
+                                "Charge_Type": ch_type,
+                                "Rate": rate_val,
+                                "Amount": amt
+                            })
+                            st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
+                        accumulated_row = ""  # reset accumulator
+                # Process any remaining accumulated text.
                 if accumulated_row:
                     result = process_fallback_row(accumulated_row)
                     if result:
@@ -245,8 +231,9 @@ def extract_charges_from_pdf(file_io):
                             "Amount": amt
                         })
                         st.write(f"Page {page_num}: Fallback extracted row (end): {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
+                    accumulated_row = ""
 
-            # Process final "Total Electric Charges" line across pages
+            # -- Process final "Total Electric Charges" line across pages --
             if "total electric charges" in text_lower:
                 for line in text.splitlines():
                     if "total electric charges" in line.lower():
