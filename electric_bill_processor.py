@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust Negative Amount & Rate Parsing with Line Accumulation) ---
+# --- Updated: Extract Charges from PDF (Robust Negative Amount & Improved Column Parsing) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -159,7 +159,7 @@ def extract_charges_from_pdf(file_io):
                                 st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                                 continue
 
-            # Fallback: Text-based extraction with robust negative parsing and line accumulation
+            # Fallback: Text-based extraction with robust negative parsing, line accumulation, and improved column splitting
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
@@ -172,9 +172,9 @@ def extract_charges_from_pdf(file_io):
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        # Preprocess to replace − with - globally
+                        # Preprocess to replace − with -
                         cleaned_line = re.sub(r'−', '-', line)
-                        # Match amount at the end of the line, allowing an optional trailing '-'
+                        # Match the amount at the end of the line, allowing an optional trailing '-'
                         amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?$', cleaned_line)
                         if amount_match:
                             num_str = amount_match.group(1)
@@ -182,21 +182,28 @@ def extract_charges_from_pdf(file_io):
                                 num_str = '-' + num_str
                             try:
                                 amount = float(num_str.replace(",", ""))
-                                rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', line)
-                                if rate_match:
-                                    rate_val = rate_match.group(1)
+                                # Remove the trailing amount from the line.
+                                remainder = cleaned_line[:amount_match.start()].strip()
+                                # Now, try to split out the rate if possible.
+                                if "X $" in remainder:
+                                    parts = remainder.split("X $", 1)
+                                    charge_type = parts[0].strip()
+                                    rate_part = parts[1].strip()
+                                    # Remove any trailing text starting with "per"
+                                    if "per" in rate_part:
+                                        rate_tokens = rate_part.split("per", 1)
+                                        rate_val = rate_tokens[0].strip()
+                                    else:
+                                        rate_val = rate_part
                                     if rate_val.endswith('-'):
                                         rate_val = '-' + rate_val[:-1]
                                 else:
+                                    charge_type = remainder
                                     rate_val = ""
-                                # Get the text before the amount match
-                                extracted_text = cleaned_line[:amount_match.start()].strip() if amount_match.start() > 0 else cleaned_line.strip()
-                                # If there is accumulated text from previous lines, prepend it.
+                                # Prepend any accumulated text from previous lines.
                                 if current_charge:
-                                    charge_type = current_charge + " " + extracted_text
-                                else:
-                                    charge_type = extracted_text
-                                # Only extract if the text has relevant keywords or the amount is negative
+                                    charge_type = current_charge + " " + charge_type
+                                # Only extract if the charge_type contains relevant keywords or the amount is negative.
                                 if any(keyword in charge_type.lower() for keyword in ["charge", "tax", "total"]) or amount < 0:
                                     row_data = {
                                         "Charge_Type": charge_type,
@@ -213,7 +220,7 @@ def extract_charges_from_pdf(file_io):
                                 st.write(f"Page {page_num}: Fallback failed to parse amount from '{num_str}' in line: {cleaned_line}")
                                 continue
                         else:
-                            # Accumulate lines that do not yet contain an amount
+                            # Accumulate lines that do not yet contain an amount.
                             if current_charge:
                                 current_charge += " " + line
                             else:
