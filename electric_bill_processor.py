@@ -3,7 +3,6 @@ import io
 import re
 import uuid
 import hashlib
-import tempfile
 from datetime import datetime
 from dateutil.parser import parse as date_parse
 import pdfplumber
@@ -19,7 +18,7 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
-# --- Helper Functions (unchanged) ---
+# --- Helper: Reassemble Table Rows Using Word Clustering (unchanged) ---
 def extract_table_rows(page, tolerance=5):
     words = page.extract_words()
     rows = {}
@@ -33,6 +32,7 @@ def extract_table_rows(page, tolerance=5):
         sorted_rows.append(row_text)
     return sorted_rows
 
+# --- Helper: Extract the Amount from a Row (unchanged) ---
 def extract_amount_from_row(row):
     m = re.search(r'per\s+k(?:Wh|W)\s+(-?[\d,]+(?:\.\d+)?)', row, re.IGNORECASE)
     if m:
@@ -50,6 +50,7 @@ def extract_amount_from_row(row):
             continue
     return None
 
+# --- Helper: Standardize Charge Type Names (unchanged) ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
     if "Total Electric Charges" in charge_type:
@@ -74,6 +75,7 @@ def standardize_charge_type(charge_type):
     charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
     return charge_type
 
+# --- Key Helper: Extract Total Use (unchanged) ---
 def extract_total_use_from_pdf(file_io):
     with pdfplumber.open(file_io) as pdf:
         if len(pdf.pages) < 2:
@@ -97,12 +99,16 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated Extraction Function ---
+# --- Updated: Extract Charges from PDF (Robust Negative Amount & Improved Fallback Column Parsing) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
     with pdfplumber.open(file_io) as pdf:
         for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            text_lower = text.lower()
+
+            # -- Table-based extraction (unchanged) --
             tables = page.find_tables({
                 "vertical_strategy": "text",
                 "horizontal_strategy": "text",
@@ -113,107 +119,169 @@ def extract_charges_from_pdf(file_io):
             })
             for table in tables:
                 extracted_table = table.extract()
-                if not extracted_table or len(extracted_table) < 2:
-                    continue
-                headers = [h.lower().strip() if h else "" for h in extracted_table[0]]
-                if (len(headers) >= 3 and
-                    headers[0] == "type of charge" and
-                    headers[1] == "how we calculate this charge" and
-                    headers[2] == "amount($)"):
-                    
-                    st.write(f"Page {page_num}: Found desired table with headers: {headers}")
-                    
-                    # Crop the page using the detected table's bounding box.
-                    bbox = table.bbox  # (x0, top, x1, bottom)
-                    cropped_page = page.within_bbox(bbox)
-                    cropped_table = cropped_page.extract_table({
-                        "vertical_strategy": "lines",
-                        "horizontal_strategy": "lines"
-                    })
-                    if not cropped_table or len(cropped_table) < 2:
-                        continue
+                if extracted_table and len(extracted_table) > 1:
+                    headers = [h.lower() if h else "" for h in extracted_table[0]]
+                    if "type of charge" in headers and "amount($)" in headers:
+                        st.write(f"Page {page_num}: Found charges table with headers: {headers}")
+                        type_idx = headers.index("type of charge")
+                        calc_idx = headers.index("how we calculate this charge") if "how we calculate this charge" in headers else -1
+                        amount_idx = headers.index("amount($)")
+                        table_bbox = table.bbox
+                        st.write(f"Page {page_num}: Table bounds: {table_bbox}")
+                        for i, row in enumerate(extracted_table[1:], start=1):
+                            if len(row) <= max(type_idx, calc_idx, amount_idx):
+                                continue
+                            charge_type = row[type_idx].strip() if row[type_idx] else ""
+                            amount_text = row[amount_idx].strip() if row[amount_idx] else ""
+                            try:
+                                amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
+                                calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
+                                rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
+                                if rate_match:
+                                    rate_val = rate_match.group(1)
+                                    if rate_val.endswith('-'):
+                                        rate_val = '-' + rate_val[:-1]
+                                else:
+                                    rate_val = ""
+                                row_data = {
+                                    "Charge_Type": charge_type,
+                                    "Rate": rate_val,
+                                    "Amount": amount
+                                }
+                                rows_out.append(row_data)
+                                st.write(f"Page {page_num}: Extracted row: {row_data}")
+                            except (ValueError, TypeError):
+                                st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
+                                continue
 
-                    encountered_total = False
-                    for row in cropped_table[1:]:
-                        # Check that the row has at least three columns
-                        if len(row) < 3:
-                            continue
-                        charge_type = row[0].strip() if row[0] else ""
-                        calc_text = row[1].strip() if row[1] else ""
-                        amount_text = row[2].strip() if row[2] else ""
-                        
-                        # Stop processing if we have encountered a total row and now see a row that doesn't start with "total"
-                        if encountered_total and not charge_type.lower().startswith("total"):
-                            break
-                        if charge_type.lower().startswith("total"):
-                            encountered_total = True
-                        
-                        try:
-                            amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
-                        except Exception as e:
-                            st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
-                            continue
-                        row_data = {
-                            "Charge_Type": charge_type,
-                            "Calculation": calc_text,
-                            "Amount": amount
-                        }
-                        rows_out.append(row_data)
-                        st.write(f"Page {page_num}: Extracted row: {row_data}")
-    
-    # Fallback extraction using Camelot if no rows were found.
+            # -- Fallback extraction using multi-line accumulation --
+            if "delivery charges" in text_lower or "supply charges" in text_lower:
+                lines = [l.strip() for l in text.splitlines() if l.strip()]
+                in_table = False
+                accumulated_row = ""
+                
+                # Helper to process an accumulated row
+                def process_fallback_row(row_text):
+                    pattern = r'(.*?)(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$'
+                    m = re.search(pattern, row_text)
+                    if not m:
+                        return None
+                    text_before = m.group(1).strip()
+                    amount_str = m.group(2)
+                    if m.group(3) == '-' and not amount_str.startswith('-'):
+                        amount_str = '-' + amount_str
+                    try:
+                        amount_val = float(amount_str.replace(",", ""))
+                    except:
+                        return None
+                    # Look for rate using the delimiter "X $"
+                    if "X $" in text_before:
+                        parts = text_before.split("X $", 1)
+                        charge = parts[0].strip()
+                        rate_part = parts[1].strip()
+                        if " per " in rate_part:
+                            rate_tokens = rate_part.split(" per ", 1)
+                            rate_val = rate_tokens[0].strip()
+                        else:
+                            rate_val = rate_part
+                        if rate_val.endswith('-'):
+                            rate_val = '-' + rate_val[:-1]
+                    else:
+                        charge = text_before
+                        rate_val = ""
+                    return (charge, rate_val, amount_val)
+                
+                st.write(f"Page {page_num}: Processing lines for fallback:")
+                for i, line in enumerate(lines):
+                    # Detect header to start processing fallback rows.
+                    if "type of charge" in line.lower() and "amount($)" in line.lower():
+                        in_table = True
+                        st.write(f"Page {page_num}: Detected table header in text: {line}")
+                        continue
+                    if not in_table:
+                        continue
+                    # Clean the current line
+                    clean_line = re.sub(r'−', '-', line)
+                    # Check if the current line itself contains an amount.
+                    if re.search(r'(-?\d{1,3}(?:,\d{1,3})*\.\d{2})(-)?\s*$', clean_line):
+                        # If we already have accumulated text, process it first.
+                        if accumulated_row:
+                            result = process_fallback_row(accumulated_row)
+                            if result:
+                                ch_type, rate_val, amt = result
+                                rows_out.append({
+                                    "Charge_Type": ch_type,
+                                    "Rate": rate_val,
+                                    "Amount": amt
+                                })
+                                st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
+                            accumulated_row = clean_line  # start new row with current line
+                        else:
+                            # No accumulation; process current line immediately.
+                            result = process_fallback_row(clean_line)
+                            if result:
+                                ch_type, rate_val, amt = result
+                                rows_out.append({
+                                    "Charge_Type": ch_type,
+                                    "Rate": rate_val,
+                                    "Amount": amt
+                                })
+                                st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
+                            accumulated_row = ""  # reset
+                    else:
+                        # No amount in the current line; accumulate.
+                        if accumulated_row:
+                            accumulated_row += " " + clean_line
+                        else:
+                            accumulated_row = clean_line
+                # End of lines – if anything remains, try to process it.
+                if accumulated_row:
+                    result = process_fallback_row(accumulated_row)
+                    if result:
+                        ch_type, rate_val, amt = result
+                        rows_out.append({
+                            "Charge_Type": ch_type,
+                            "Rate": rate_val,
+                            "Amount": amt
+                        })
+                        st.write(f"Page {page_num}: Fallback extracted row (end): {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
+
+            # Process final "Total Electric Charges" line across pages
+            if "total electric charges" in text_lower:
+                for line in text.splitlines():
+                    if "total electric charges" in line.lower():
+                        st.write(f"Page {page_num}: Processing final total line: {line}")
+                        cleaned_line = re.sub(r'−', '-', line)
+                        m = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$', cleaned_line)
+                        if m:
+                            num_str = m.group(1)
+                            if m.group(2) == '-' and not num_str.startswith('-'):
+                                num_str = '-' + num_str
+                            try:
+                                amount = float(num_str.replace(",", ""))
+                                total_exists = next((r for r in rows_out if "total electric charges" in r["Charge_Type"].lower()), None)
+                                if total_exists:
+                                    total_exists["Amount"] = amount
+                                    total_exists["Charge_Type"] = "Total Electric Charges"
+                                    st.write(f"Page {page_num}: Updated existing Total Electric Charges to: {amount}")
+                                else:
+                                    row_data = {
+                                        "Charge_Type": "Total Electric Charges",
+                                        "Rate": "",
+                                        "Amount": amount
+                                    }
+                                    rows_out.append(row_data)
+                                    st.write(f"Page {page_num}: Extracted final total row: {row_data}")
+                            except (ValueError, TypeError):
+                                st.write(f"Page {page_num}: Failed to parse final total from '{num_str}' in line: {cleaned_line}")
+
     if not rows_out:
-        st.write("No charges tables found with pdfplumber, trying Camelot extraction as fallback.")
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(file_io.getvalue())
-            tmp_file_path = tmp_file.name
-        try:
-            import camelot
-            camelot_tables = camelot.read_pdf(tmp_file_path, table_areas=['50,500,500,50'], flavor='stream')
-            for idx, table in enumerate(camelot_tables):
-                st.write(f"Camelot Table {idx} extraction:")
-                df = table.df
-                if df.empty or df.shape[1] < 3:
-                    continue
-                headers = df.iloc[0].str.lower().tolist()
-                if (len(headers) >= 3 and 
-                    headers[0] == "type of charge" and 
-                    headers[1] == "how we calculate this charge" and 
-                    headers[2] == "amount($)"):
-                    encountered_total = False
-                    for i in range(1, len(df)):
-                        row = df.iloc[i].tolist()
-                        if len(row) < 3:
-                            continue
-                        charge_type = row[0].strip() if row[0] else ""
-                        calc_text = row[1].strip() if row[1] else ""
-                        amount_text = row[2].strip() if row[2] else ""
-                        if encountered_total and not charge_type.lower().startswith("total"):
-                            break
-                        if charge_type.lower().startswith("total"):
-                            encountered_total = True
-                        try:
-                            amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
-                        except Exception as e:
-                            st.write(f"Camelot failed to parse amount from '{amount_text}' in row: {row}")
-                            continue
-                        row_data = {
-                            "Charge_Type": charge_type,
-                            "Calculation": calc_text,
-                            "Amount": amount
-                        }
-                        rows_out.append(row_data)
-                        st.write(f"Camelot extracted row: {row_data}")
-        except Exception as e:
-            st.write("Camelot extraction error: ", e)
-    
-    if not rows_out:
-        st.write("No charges extracted from the PDF.")
+        st.write("No charges tables found in the PDF.")
     else:
         st.write(f"Total charges extracted: {len(rows_out)}")
     return rows_out
 
-# --- Metadata Extraction (unchanged) ---
+# --- Extract Metadata from PDF (unchanged) ---
 def extract_metadata_from_pdf(file_bytes):
     metadata = {"Bill_Month_Year": "", "Account_Number": ""}
     with pdfplumber.open(file_bytes) as pdf:
@@ -254,13 +322,13 @@ def process_pdf(file_io):
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
         amt = c["Amount"]
-        calc_val = c["Calculation"]
+        rate_val = c["Rate"]
         if ct in consolidated:
             consolidated[ct]["Amount"] += amt
-            if not consolidated[ct]["Calculation"] and calc_val:
-                consolidated[ct]["Calculation"] = calc_val
+            if not consolidated[ct]["Rate"] and rate_val:
+                consolidated[ct]["Rate"] = rate_val
         else:
-            consolidated[ct] = {"Amount": amt, "Calculation": calc_val}
+            consolidated[ct] = {"Amount": amt, "Rate": rate_val}
 
     st.write("Consolidated Charges:", consolidated)
 
@@ -297,13 +365,13 @@ def process_pdf(file_io):
     for ct in consolidated:
         if consolidated[ct]["Amount"] != 0:
             output_row[f"{ct} Amount"] = consolidated[ct]["Amount"]
-        if consolidated[ct]["Calculation"]:
-            output_row[f"{ct} Calculation"] = consolidated[ct]["Calculation"]
+        if consolidated[ct]["Rate"]:
+            output_row[f"{ct} Rate"] = consolidated[ct]["Rate"]
 
     st.write("Final Output Row:", output_row)
     return output_row
 
-# --- Sheet Append Function (unchanged, with update keyword arguments) ---
+# --- Sheet Append Function (unchanged) ---
 def append_row_to_sheet(row_dict):
     meta_cols = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
     current_data = worksheet.get_all_values()
@@ -321,12 +389,12 @@ def append_row_to_sheet(row_dict):
     full_headers = meta_cols + all_charge_cols
 
     if full_headers != headers:
-        worksheet.update(range_name="A1", values=[full_headers])
+        worksheet.update("A1", [full_headers])
         if existing_rows:
             for i, row in enumerate(existing_rows, start=2):
                 row_dict_existing = dict(zip(headers, row))
                 padded_row = [str(row_dict_existing.get(h, "")) for h in full_headers]
-                worksheet.update(range_name=f"A{i}", values=[padded_row])
+                worksheet.update(f"A{i}", [padded_row])
 
     row_values = [str(row_dict.get(h, "")) for h in full_headers]
     worksheet.append_row(row_values)
