@@ -182,7 +182,8 @@ def extract_charges_from_pdf(file_io):
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', line)
                                 rate_val = rate_match.group(1) if rate_match else ""
                                 charge_type = cleaned_line[:amount_match.start()].strip() if amount_match.start() > 0 else cleaned_line.strip()
-                                if any(keyword in charge_type.lower() for keyword in ["charge", "tax", "total"]):
+                                # Allow extraction if the charge type contains keywords OR if the amount is negative
+                                if any(keyword in charge_type.lower() for keyword in ["charge", "tax", "total"]) or amount < 0:
                                     row_data = {
                                         "Charge_Type": charge_type,
                                         "Rate": rate_val,
