@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust Negative Amount Parsing) ---
+# --- Updated: Extract Charges from PDF (Robust Negative Amount & Rate Parsing) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -140,7 +140,12 @@ def extract_charges_from_pdf(file_io):
                                 amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
                                 calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', calc_text)
-                                rate_val = rate_match.group(1) if rate_match else ""
+                                if rate_match:
+                                    rate_val = rate_match.group(1)
+                                    if rate_val.endswith('-'):
+                                        rate_val = '-' + rate_val[:-1]
+                                else:
+                                    rate_val = ""
                                 row_data = {
                                     "Charge_Type": charge_type,
                                     "Rate": rate_val,
@@ -173,14 +178,17 @@ def extract_charges_from_pdf(file_io):
                         amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?$', cleaned_line)
                         if amount_match:
                             num_str = amount_match.group(1)
-                            # If a trailing '-' is present and num_str doesn't already start with '-', prepend it
                             if amount_match.group(2) == '-' and not num_str.startswith('-'):
                                 num_str = '-' + num_str
                             try:
                                 amount = float(num_str.replace(",", ""))
-                                # Extract charge type and rate from the current line only
                                 rate_match = re.search(r'X\s+\$([\d\.]+(?:[−-])?)', line)
-                                rate_val = rate_match.group(1) if rate_match else ""
+                                if rate_match:
+                                    rate_val = rate_match.group(1)
+                                    if rate_val.endswith('-'):
+                                        rate_val = '-' + rate_val[:-1]
+                                else:
+                                    rate_val = ""
                                 charge_type = cleaned_line[:amount_match.start()].strip() if amount_match.start() > 0 else cleaned_line.strip()
                                 # Allow extraction if the charge type contains keywords OR if the amount is negative
                                 if any(keyword in charge_type.lower() for keyword in ["charge", "tax", "total"]) or amount < 0:
