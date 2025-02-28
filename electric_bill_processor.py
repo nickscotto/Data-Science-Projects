@@ -138,21 +138,20 @@ def extract_charges_from_pdf(file_io):
                         if not cropped_table:
                             continue
                         # Process rows from the cropped region.
-                        # We'll use the header as the top bound.
+                        # Use the header as the top bound and process rows until a non-total row follows a total row.
                         encountered_total = False
                         for row in cropped_table[1:]:
+                            # Ensure the row has at least three cells.
                             if len(row) < 3:
                                 continue
                             charge_type = row[0].strip() if row[0] else ""
                             calc_text = row[1].strip() if row[1] else ""
                             amount_text = row[2].strip() if row[2] else ""
                             
-                            # If we've already encountered a row starting with "total" and the current row does not,
-                            # then we assume the table has ended.
+                            # If we've encountered a row starting with "total" and the current row does not, stop processing.
                             if encountered_total and not charge_type.lower().startswith("total"):
                                 break
                             
-                            # Mark that we've encountered a "total" row when applicable.
                             if charge_type.lower().startswith("total"):
                                 encountered_total = True
                             
@@ -329,12 +328,13 @@ def append_row_to_sheet(row_dict):
     full_headers = meta_cols + all_charge_cols
 
     if full_headers != headers:
-        worksheet.update("A1", [full_headers])
+        # Updated to use keyword arguments per deprecation warning.
+        worksheet.update(range_name="A1", values=[full_headers])
         if existing_rows:
             for i, row in enumerate(existing_rows, start=2):
                 row_dict_existing = dict(zip(headers, row))
                 padded_row = [str(row_dict_existing.get(h, "")) for h in full_headers]
-                worksheet.update(f"A{i}", [padded_row])
+                worksheet.update(range_name=f"A{i}", values=[padded_row])
 
     row_values = [str(row_dict.get(h, "")) for h in full_headers]
     worksheet.append_row(row_values)
