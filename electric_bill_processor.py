@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Robust Negative Amount & Improved Column Parsing) ---
+# --- Updated: Extract Charges from PDF (Robust Negative Amount & Improved Fallback Column Parsing) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -108,7 +108,7 @@ def extract_charges_from_pdf(file_io):
             text = page.extract_text() or ""
             text_lower = text.lower()
 
-            # Try to detect tables with specific headers
+            # -- Table-based extraction (unchanged) --
             tables = page.find_tables({
                 "vertical_strategy": "text",
                 "horizontal_strategy": "text",
@@ -117,7 +117,6 @@ def extract_charges_from_pdf(file_io):
                 "edge_min_length": 3,
                 "intersection_tolerance": 5,
             })
-            
             for table in tables:
                 extracted_table = table.extract()
                 if extracted_table and len(extracted_table) > 1:
@@ -129,13 +128,11 @@ def extract_charges_from_pdf(file_io):
                         amount_idx = headers.index("amount($)")
                         table_bbox = table.bbox
                         st.write(f"Page {page_num}: Table bounds: {table_bbox}")
-
                         for i, row in enumerate(extracted_table[1:], start=1):
                             if len(row) <= max(type_idx, calc_idx, amount_idx):
                                 continue
                             charge_type = row[type_idx].strip() if row[type_idx] else ""
                             amount_text = row[amount_idx].strip() if row[amount_idx] else ""
-                            
                             try:
                                 amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
                                 calc_text = row[calc_idx].strip() if calc_idx >= 0 and row[calc_idx] else ""
@@ -153,89 +150,112 @@ def extract_charges_from_pdf(file_io):
                                 }
                                 rows_out.append(row_data)
                                 st.write(f"Page {page_num}: Extracted row: {row_data}")
-                                if "total" in charge_type.lower() and i == len(extracted_table[1:]):
-                                    st.write(f"Page {page_num}: Last row is a total, ending table: {charge_type}")
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                                 continue
 
-            # Fallback: Text-based extraction with robust negative parsing, line accumulation, and improved column splitting
+            # -- Fallback extraction using multi-line accumulation --
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
-                current_charge = ""
+                accumulated_row = ""
+                
+                # Helper to process an accumulated row
+                def process_fallback_row(row_text):
+                    pattern = r'(.*?)(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$'
+                    m = re.search(pattern, row_text)
+                    if not m:
+                        return None
+                    text_before = m.group(1).strip()
+                    amount_str = m.group(2)
+                    if m.group(3) == '-' and not amount_str.startswith('-'):
+                        amount_str = '-' + amount_str
+                    try:
+                        amount_val = float(amount_str.replace(",", ""))
+                    except:
+                        return None
+                    # Look for rate using the delimiter "X $"
+                    if "X $" in text_before:
+                        parts = text_before.split("X $", 1)
+                        charge = parts[0].strip()
+                        rate_part = parts[1].strip()
+                        if " per " in rate_part:
+                            rate_tokens = rate_part.split(" per ", 1)
+                            rate_val = rate_tokens[0].strip()
+                        else:
+                            rate_val = rate_part
+                        if rate_val.endswith('-'):
+                            rate_val = '-' + rate_val[:-1]
+                    else:
+                        charge = text_before
+                        rate_val = ""
+                    return (charge, rate_val, amount_val)
+                
                 st.write(f"Page {page_num}: Processing lines for fallback:")
                 for i, line in enumerate(lines):
+                    # Detect header to start processing fallback rows.
                     if "type of charge" in line.lower() and "amount($)" in line.lower():
                         in_table = True
                         st.write(f"Page {page_num}: Detected table header in text: {line}")
                         continue
-                    if in_table:
-                        st.write(f"Page {page_num}: Processing line: {line}")
-                        # Preprocess to replace − with -
-                        cleaned_line = re.sub(r'−', '-', line)
-                        # Match the amount at the end of the line, allowing an optional trailing '-'
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?$', cleaned_line)
-                        if amount_match:
-                            num_str = amount_match.group(1)
-                            if amount_match.group(2) == '-' and not num_str.startswith('-'):
-                                num_str = '-' + num_str
-                            try:
-                                amount = float(num_str.replace(",", ""))
-                                # Remove the trailing amount from the line.
-                                remainder = cleaned_line[:amount_match.start()].strip()
-                                # Now, try to split out the rate if possible.
-                                if "X $" in remainder:
-                                    parts = remainder.split("X $", 1)
-                                    charge_type = parts[0].strip()
-                                    rate_part = parts[1].strip()
-                                    # Remove any trailing text starting with "per"
-                                    if "per" in rate_part:
-                                        rate_tokens = rate_part.split("per", 1)
-                                        rate_val = rate_tokens[0].strip()
-                                    else:
-                                        rate_val = rate_part
-                                    if rate_val.endswith('-'):
-                                        rate_val = '-' + rate_val[:-1]
-                                else:
-                                    charge_type = remainder
-                                    rate_val = ""
-                                # Prepend any accumulated text from previous lines.
-                                if current_charge:
-                                    charge_type = current_charge + " " + charge_type
-                                # Only extract if the charge_type contains relevant keywords or the amount is negative.
-                                if any(keyword in charge_type.lower() for keyword in ["charge", "tax", "total"]) or amount < 0:
-                                    row_data = {
-                                        "Charge_Type": charge_type,
-                                        "Rate": rate_val,
-                                        "Amount": amount
-                                    }
-                                    rows_out.append(row_data)
-                                    st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
-                                    if "total" in charge_type.lower() and (i == len(lines) - 1 or not any("charge" in next_line.lower() or "total" in next_line.lower() for next_line in lines[i+1:])):
-                                        st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
-                                        in_table = False
-                                current_charge = ""  # Reset after processing a complete charge
-                            except (ValueError, TypeError):
-                                st.write(f"Page {page_num}: Fallback failed to parse amount from '{num_str}' in line: {cleaned_line}")
-                                continue
+                    if not in_table:
+                        continue
+                    # Clean the current line
+                    clean_line = re.sub(r'−', '-', line)
+                    # Check if the current line itself contains an amount.
+                    if re.search(r'(-?\d{1,3}(?:,\d{1,3})*\.\d{2})(-)?\s*$', clean_line):
+                        # If we already have accumulated text, process it first.
+                        if accumulated_row:
+                            result = process_fallback_row(accumulated_row)
+                            if result:
+                                ch_type, rate_val, amt = result
+                                rows_out.append({
+                                    "Charge_Type": ch_type,
+                                    "Rate": rate_val,
+                                    "Amount": amt
+                                })
+                                st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
+                            accumulated_row = clean_line  # start new row with current line
                         else:
-                            # Accumulate lines that do not yet contain an amount.
-                            if current_charge:
-                                current_charge += " " + line
-                            else:
-                                current_charge = line
+                            # No accumulation; process current line immediately.
+                            result = process_fallback_row(clean_line)
+                            if result:
+                                ch_type, rate_val, amt = result
+                                rows_out.append({
+                                    "Charge_Type": ch_type,
+                                    "Rate": rate_val,
+                                    "Amount": amt
+                                })
+                                st.write(f"Page {page_num}: Fallback extracted row: {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
+                            accumulated_row = ""  # reset
+                    else:
+                        # No amount in the current line; accumulate.
+                        if accumulated_row:
+                            accumulated_row += " " + clean_line
+                        else:
+                            accumulated_row = clean_line
+                # End of lines – if anything remains, try to process it.
+                if accumulated_row:
+                    result = process_fallback_row(accumulated_row)
+                    if result:
+                        ch_type, rate_val, amt = result
+                        rows_out.append({
+                            "Charge_Type": ch_type,
+                            "Rate": rate_val,
+                            "Amount": amt
+                        })
+                        st.write(f"Page {page_num}: Fallback extracted row (end): {{'Charge_Type': '{ch_type}', 'Rate': '{rate_val}', 'Amount': {amt}}}")
 
-            # Look for the final "Total Electric Charges" line across all pages
+            # Process final "Total Electric Charges" line across pages
             if "total electric charges" in text_lower:
-                for line in lines:
+                for line in text.splitlines():
                     if "total electric charges" in line.lower():
                         st.write(f"Page {page_num}: Processing final total line: {line}")
                         cleaned_line = re.sub(r'−', '-', line)
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?$', cleaned_line)
-                        if amount_match:
-                            num_str = amount_match.group(1)
-                            if amount_match.group(2) == '-' and not num_str.startswith('-'):
+                        m = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})(-)?\s*$', cleaned_line)
+                        if m:
+                            num_str = m.group(1)
+                            if m.group(2) == '-' and not num_str.startswith('-'):
                                 num_str = '-' + num_str
                             try:
                                 amount = float(num_str.replace(",", ""))
