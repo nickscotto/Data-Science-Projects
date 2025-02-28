@@ -19,7 +19,7 @@ SPREADSHEET_ID = "1km-vdnfpgYWCP_NXNJC1aCoj-pWc2A2BUU8AFkznEEY"
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 worksheet = spreadsheet.sheet1
 
-# --- Helper: Reassemble Table Rows Using Word Clustering (unchanged) ---
+# --- Helper Functions (unchanged) ---
 def extract_table_rows(page, tolerance=5):
     words = page.extract_words()
     rows = {}
@@ -33,7 +33,6 @@ def extract_table_rows(page, tolerance=5):
         sorted_rows.append(row_text)
     return sorted_rows
 
-# --- Helper: Extract the Amount from a Row (unchanged) ---
 def extract_amount_from_row(row):
     m = re.search(r'per\s+k(?:Wh|W)\s+(-?[\d,]+(?:\.\d+)?)', row, re.IGNORECASE)
     if m:
@@ -51,7 +50,6 @@ def extract_amount_from_row(row):
             continue
     return None
 
-# --- Helper: Standardize Charge Type Names (unchanged) ---
 def standardize_charge_type(charge_type):
     charge_type = charge_type.strip()
     if "Total Electric Charges" in charge_type:
@@ -76,7 +74,6 @@ def standardize_charge_type(charge_type):
     charge_type = re.sub(r'\s*\d+\s*k(?:Wh|W)', ' kWh', charge_type).strip()
     return charge_type
 
-# --- Key Helper: Extract Total Use (unchanged) ---
 def extract_total_use_from_pdf(file_io):
     with pdfplumber.open(file_io) as pdf:
         if len(pdf.pages) < 2:
@@ -100,11 +97,10 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF with Bounding Box and "Total" Logic ---
+# --- Updated Extraction Function ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
-    # First pass: using pdfplumber extraction
     with pdfplumber.open(file_io) as pdf:
         for page_num, page in enumerate(pdf.pages):
             tables = page.find_tables({
@@ -117,56 +113,53 @@ def extract_charges_from_pdf(file_io):
             })
             for table in tables:
                 extracted_table = table.extract()
-                if extracted_table and len(extracted_table) > 1:
-                    headers = [h.lower().strip() if h else "" for h in extracted_table[0]]
-                    # Check for the exact header match:
-                    # "Type of charge", "How we calculate this charge", "Amount($)"
-                    if (len(headers) >= 3 and 
-                        headers[0] == "type of charge" and 
-                        headers[1] == "how we calculate this charge" and 
-                        headers[2] == "amount($)"):
-                        
-                        st.write(f"Page {page_num}: Found desired table with headers: {headers}")
-                        
-                        # Use the table's bounding box to crop the page.
-                        bbox = table.bbox  # (x0, top, x1, bottom)
-                        cropped_page = page.within_bbox(bbox)
-                        cropped_table = cropped_page.extract_table({
-                            "vertical_strategy": "lines",
-                            "horizontal_strategy": "lines"
-                        })
-                        if not cropped_table:
+                if not extracted_table or len(extracted_table) < 2:
+                    continue
+                headers = [h.lower().strip() if h else "" for h in extracted_table[0]]
+                if (len(headers) >= 3 and
+                    headers[0] == "type of charge" and
+                    headers[1] == "how we calculate this charge" and
+                    headers[2] == "amount($)"):
+                    
+                    st.write(f"Page {page_num}: Found desired table with headers: {headers}")
+                    
+                    # Crop the page using the detected table's bounding box.
+                    bbox = table.bbox  # (x0, top, x1, bottom)
+                    cropped_page = page.within_bbox(bbox)
+                    cropped_table = cropped_page.extract_table({
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines"
+                    })
+                    if not cropped_table or len(cropped_table) < 2:
+                        continue
+
+                    encountered_total = False
+                    for row in cropped_table[1:]:
+                        # Check that the row has at least three columns
+                        if len(row) < 3:
                             continue
-                        # Process rows from the cropped region.
-                        # Use the header as the top bound and process rows until a non-total row follows a total row.
-                        encountered_total = False
-                        for row in cropped_table[1:]:
-                            # Ensure the row has at least three cells.
-                            if len(row) < 3:
-                                continue
-                            charge_type = row[0].strip() if row[0] else ""
-                            calc_text = row[1].strip() if row[1] else ""
-                            amount_text = row[2].strip() if row[2] else ""
-                            
-                            # If we've encountered a row starting with "total" and the current row does not, stop processing.
-                            if encountered_total and not charge_type.lower().startswith("total"):
-                                break
-                            
-                            if charge_type.lower().startswith("total"):
-                                encountered_total = True
-                            
-                            try:
-                                amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
-                            except Exception as e:
-                                st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
-                                continue
-                            row_data = {
-                                "Charge_Type": charge_type,
-                                "Calculation": calc_text,
-                                "Amount": amount
-                            }
-                            rows_out.append(row_data)
-                            st.write(f"Page {page_num}: Extracted row: {row_data}")
+                        charge_type = row[0].strip() if row[0] else ""
+                        calc_text = row[1].strip() if row[1] else ""
+                        amount_text = row[2].strip() if row[2] else ""
+                        
+                        # Stop processing if we have encountered a total row and now see a row that doesn't start with "total"
+                        if encountered_total and not charge_type.lower().startswith("total"):
+                            break
+                        if charge_type.lower().startswith("total"):
+                            encountered_total = True
+                        
+                        try:
+                            amount = float(amount_text.replace("$", "").replace(",", "").replace("−", "-"))
+                        except Exception as e:
+                            st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
+                            continue
+                        row_data = {
+                            "Charge_Type": charge_type,
+                            "Calculation": calc_text,
+                            "Amount": amount
+                        }
+                        rows_out.append(row_data)
+                        st.write(f"Page {page_num}: Extracted row: {row_data}")
     
     # Fallback extraction using Camelot if no rows were found.
     if not rows_out:
@@ -220,7 +213,7 @@ def extract_charges_from_pdf(file_io):
         st.write(f"Total charges extracted: {len(rows_out)}")
     return rows_out
 
-# --- Extract Metadata from PDF (unchanged) ---
+# --- Metadata Extraction (unchanged) ---
 def extract_metadata_from_pdf(file_bytes):
     metadata = {"Bill_Month_Year": "", "Account_Number": ""}
     with pdfplumber.open(file_bytes) as pdf:
@@ -261,13 +254,13 @@ def process_pdf(file_io):
     for c in charges:
         ct = standardize_charge_type(c["Charge_Type"])
         amt = c["Amount"]
-        rate_val = c["Calculation"]
+        calc_val = c["Calculation"]
         if ct in consolidated:
             consolidated[ct]["Amount"] += amt
-            if not consolidated[ct]["Calculation"] and rate_val:
-                consolidated[ct]["Calculation"] = rate_val
+            if not consolidated[ct]["Calculation"] and calc_val:
+                consolidated[ct]["Calculation"] = calc_val
         else:
-            consolidated[ct] = {"Amount": amt, "Calculation": rate_val}
+            consolidated[ct] = {"Amount": amt, "Calculation": calc_val}
 
     st.write("Consolidated Charges:", consolidated)
 
@@ -310,7 +303,7 @@ def process_pdf(file_io):
     st.write("Final Output Row:", output_row)
     return output_row
 
-# --- Sheet Append Function (unchanged) ---
+# --- Sheet Append Function (unchanged, with update keyword arguments) ---
 def append_row_to_sheet(row_dict):
     meta_cols = ["User_ID", "Bill_ID", "Bill_Month_Year", "Bill_Hash", "Total Use"]
     current_data = worksheet.get_all_values()
@@ -328,7 +321,6 @@ def append_row_to_sheet(row_dict):
     full_headers = meta_cols + all_charge_cols
 
     if full_headers != headers:
-        # Updated to use keyword arguments per deprecation warning.
         worksheet.update(range_name="A1", values=[full_headers])
         if existing_rows:
             for i, row in enumerate(existing_rows, start=2):
