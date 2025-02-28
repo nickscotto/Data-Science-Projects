@@ -99,7 +99,7 @@ def extract_total_use_from_pdf(file_io):
                         return tokens[j]
         return ""
 
-# --- Updated: Extract Charges from PDF (Fix Negative Amounts) ---
+# --- Updated: Extract Charges from PDF (Fix Negative Amounts with Strict Parsing) ---
 def extract_charges_from_pdf(file_io):
     rows_out = []
     
@@ -154,7 +154,7 @@ def extract_charges_from_pdf(file_io):
                                 st.write(f"Page {page_num}: Failed to parse amount from '{amount_text}' in row: {row}")
                                 continue
 
-            # Fallback: Text-based extraction with improved parsing
+            # Fallback: Text-based extraction with strict amount parsing
             if "delivery charges" in text_lower or "supply charges" in text_lower:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 in_table = False
@@ -167,11 +167,11 @@ def extract_charges_from_pdf(file_io):
                         continue
                     if in_table:
                         st.write(f"Page {page_num}: Processing line: {line}")
-                        # Preprocess line to replace − with - before matching
+                        # Preprocess to replace − with - before matching
                         cleaned_line = re.sub(r'−', '-', line)
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})$', cleaned_line)
+                        amount_match = re.search(r'(?:-)?\d{1,3}(?:,\d{3})*\.\d{2}(?:-)?$', cleaned_line)
                         if amount_match:
-                            amount_text = amount_match.group(0).replace(",", "")
+                            amount_text = amount_match.group(0).replace("-", "-").replace(",", "")  # Ensure consistent minus
                             try:
                                 amount = float(amount_text)
                                 combined_line = current_charge + " " + line if current_charge else line
@@ -179,16 +179,18 @@ def extract_charges_from_pdf(file_io):
                                 rate_val = rate_match.group(1) if rate_match else ""
                                 charge_type_end = combined_line.find("X $") if rate_val else amount_match.start()
                                 charge_type = combined_line[:charge_type_end].strip() if charge_type_end > 0 else combined_line.strip()
-                                row_data = {
-                                    "Charge_Type": charge_type,
-                                    "Rate": rate_val,
-                                    "Amount": amount
-                                }
-                                rows_out.append(row_data)
-                                st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
-                                if "total" in charge_type.lower() and (i == len(lines) - 1 or not any("charge" in next_line.lower() or "total" in next_line.lower() for next_line in lines[i+1:])):
-                                    st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
-                                    in_table = False
+                                # Only process if the line contains a charge-related pattern
+                                if any(keyword in charge_type.lower() for keyword in ["charge", "tax", "total"]):
+                                    row_data = {
+                                        "Charge_Type": charge_type,
+                                        "Rate": rate_val,
+                                        "Amount": amount
+                                    }
+                                    rows_out.append(row_data)
+                                    st.write(f"Page {page_num}: Fallback extracted row: {row_data}")
+                                    if "total" in charge_type.lower() and (i == len(lines) - 1 or not any("charge" in next_line.lower() or "total" in next_line.lower() for next_line in lines[i+1:])):
+                                        st.write(f"Page {page_num}: Last total row detected, ending table: {charge_type}")
+                                        in_table = False
                                 current_charge = ""
                             except (ValueError, TypeError):
                                 st.write(f"Page {page_num}: Fallback failed to parse amount from '{amount_text}' in line: {cleaned_line}")
@@ -202,16 +204,16 @@ def extract_charges_from_pdf(file_io):
                     if "total electric charges" in line.lower():
                         st.write(f"Page {page_num}: Processing final total line: {line}")
                         cleaned_line = re.sub(r'−', '-', line)
-                        amount_match = re.search(r'(-?\d{1,3}(?:,\d{3})*\.\d{2})$', cleaned_line)
+                        amount_match = re.search(r'(?:-)?\d{1,3}(?:,\d{3})*\.\d{2}(?:-)?$', cleaned_line)
                         if amount_match:
-                            amount_text = amount_match.group(0).replace(",", "")
+                            amount_text = amount_match.group(0).replace("-", "-").replace(",", "")
                             try:
                                 amount = float(amount_text)
                                 # Check for existing Total Electric Charges and update if variant found
                                 total_exists = next((r for r in rows_out if "total electric charges" in r["Charge_Type"].lower()), None)
                                 if total_exists:
                                     total_exists["Amount"] = amount
-                                    total_exists["Charge_Type"] = "Total Electric Charges"  # Standardize to base name
+                                    total_exists["Charge_Type"] = "Total Electric Charges"
                                     st.write(f"Page {page_num}: Updated existing Total Electric Charges to: {amount}")
                                 else:
                                     row_data = {
